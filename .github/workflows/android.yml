@@ -1,7 +1,7 @@
 # Android (Folio Writer, apps/wordcraft-android): lints and tests the Android host on Linux and for the
 # Android target, builds the debug APK (arm64-v8a for tablets, x86_64 for the emulator) and starts it on
-# emulators (API 34 and 36): install, sample document on Vulkan and on OpenGL ES, screenshots, no crash,
-# and a deliberate panic that must reach logcat with its backtrace.
+# tablet emulators (API 34 and 36): install, sample document on Vulkan and on OpenGL ES, screenshots, no
+# crash, and a deliberate panic that must reach logcat with its backtrace.
 #
 # Runs on pushes and pull requests that touch the Android app or what it's built from.
 name: Android
@@ -171,6 +171,8 @@ jobs:
           api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
+          # A tablet: 2560×1600 at 320 dpi.
+          profile: pixel_tablet
           cores: 4
           ram-size: 4096M
           force-avd-creation: true
