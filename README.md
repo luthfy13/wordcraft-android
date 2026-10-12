@@ -1,11 +1,6 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
+> **This fork** (`luthfy13/wordcraft-android`) adds **Folio Writer**, WordCraft as a native Android app
+> for tablets: see [`apps/wordcraft-android/README.md`](apps/wordcraft-android/README.md). It's a modified
+> version, so it carries none of the ArtCraft marks (the brand licence asks forks to remove them).
 
 <h1 align="center">WordCraft</h1>
 
@@ -351,14 +346,12 @@ Hyphenator II word list. Polish spelling reads the Hunspell `pl_PL` dictionary i
 Polish hyphenation the TeX patterns by Hanna Kołodziejska, Bogusław Jackowski and Marek Ryćko (MIT
 option). The sample documents and templates are original text written for WordCraft.
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and WordCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team and are not covered by
+this license. Forks and modified versions must remove them, so this fork doesn't include them (upstream
+keeps them in `docs/brand/`, with their licence).
 
 <sub>Microsoft and Microsoft Word are trademarks of the Microsoft group of companies. Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. WordCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Microsoft Corporation or Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <sub>WordCraft is made by the ArtCraft team and community; Folio Writer is a modified version of it.</sub>
 </p>

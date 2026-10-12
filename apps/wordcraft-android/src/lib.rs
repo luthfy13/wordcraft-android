@@ -8,10 +8,17 @@
 // Off Android only the tests use the host.
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
+mod about;
 mod crash;
+mod files;
 mod host;
+mod ime;
 mod input;
 mod keymap;
+mod platform;
+mod prompts;
+mod recovery;
+mod store;
 
 #[cfg(target_os = "android")]
 mod android;

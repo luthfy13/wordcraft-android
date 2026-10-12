@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12 and later: backups and device transfers keep the settings and the custom dictionary, never
+     documents or recovery snapshots (`files/wordcraft/recovery`). -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="wordcraft/ui.json" />
+        <include domain="file" path="wordcraft/custom-dictionary.txt" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="wordcraft/ui.json" />
+        <include domain="file" path="wordcraft/custom-dictionary.txt" />
+    </device-transfer>
+</data-extraction-rules>

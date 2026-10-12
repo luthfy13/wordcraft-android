@@ -5,16 +5,33 @@
 //! or the GPU, so tests drive it on the host.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::output::OutputCommand;
-use egui::{ClippedPrimitive, Event, RawInput, Rect, TexturesDelta, Theme, ViewportId, ViewportInfo, pos2};
+use egui::{ClippedPrimitive, CursorIcon, Event, RawInput, Rect, TexturesDelta, Theme, ViewportId, ViewportInfo, pos2};
+use serde_json::json;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
-use crate::input::{KeyPress, Motion, Translator};
+use crate::about::About;
+use crate::files::{FileEvent, FileOp, Files};
+use crate::ime::{self, Ime, Target};
+use crate::input::{Action, KeyPress, Motion, TAP_SLOP, Tool, Translator};
+use crate::keymap::{self, code};
+use crate::platform::{self, Inbound, Platform};
+use crate::prompts::Prompts;
+use crate::recovery::Recovery;
+use crate::store::{self, Dirs};
+
+/// How long quitting waits for documents to be written back before giving up.
+const QUIT_WAIT: Duration = Duration::from_secs(15);
+/// Keyboard states waiting beyond this are applied together.
+const IME_BACKLOG: usize = 64;
 
 /// What to open at start-up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,8 +71,6 @@ pub struct Frame {
     pub primitives: Vec<ClippedPrimitive>,
     pub textures: TexturesDelta,
     pub pixels_per_point: f32,
-    /// Links the user opened.
-    pub urls: Vec<String>,
 }
 
 /// The WordCraft app and egui, driven by the platform.
@@ -64,26 +79,77 @@ pub struct Host {
     app: WordApp,
     input: Translator,
     events: Vec<Event>,
-    /// Text copied in the app. The system clipboard comes in a later phase; until then copy and paste
-    /// work inside the app.
-    clipboard: Rc<RefCell<String>>,
+    /// Text copied in the app: the clipboard without a platform (tests), and what's pasted when the
+    /// system clipboard can't be read or didn't take the last copy (too large).
+    clipboard: Rc<RefCell<Clip>>,
+    /// Android, or `None` (tests: the app's own file browser and clipboard).
+    platform: Option<Rc<dyn Platform>>,
+    files: Option<Files>,
+    /// Documents to hand the app as dropped files in the next frame (Open with, Share).
+    dropped: Vec<PathBuf>,
+    prompts: Prompts,
+    about: About,
+    /// The pointer's shape last sent.
+    cursor: Option<CursorIcon>,
+    /// The window title last sent (the document's name).
+    title: Option<String>,
+    /// The app's state when Back was pressed: if Back (as Esc) changes nothing, the app goes to the
+    /// background.
+    back: Option<BackState>,
+    /// Since when quitting waits for write-backs.
+    quitting: Option<Instant>,
+    ime: Ime,
+    /// Where a finger or pen went down (px), while it hasn't moved: a tap asks for the keyboard.
+    touch: Option<egui::Pos2>,
+    /// A tap since the last frame (px).
+    tapped: Option<egui::Pos2>,
+    /// The focused text field's text, as egui last reported it.
+    field: Option<String>,
+    /// A dialog field wants a password: the keyboard shows no suggestions.
+    password: bool,
+    /// The keyboard's states not applied yet: one a frame, so each applies to the document the one
+    /// before left.
+    ime_states: VecDeque<(u32, ime::Buf)>,
     start: Instant,
     window: Option<Window>,
     focused: bool,
     system_theme: Option<Theme>,
     max_texture_side: usize,
+    /// The app's files; `None` keeps nothing between runs (tests).
+    dirs: Option<Dirs>,
+    recovery: Option<Recovery>,
 }
 
 impl Host {
-    pub fn new(launch: &Launch) -> Self {
-        let clipboard = Rc::new(RefCell::new(String::new()));
+    /// The app, with the settings and any unsaved document a previous run left in `dirs`.
+    pub fn new(launch: &Launch, dirs: Option<Dirs>, platform: Option<Rc<dyn Platform>>) -> Self {
+        let clipboard = Rc::new(RefCell::new(Clip::default()));
+        // Added fonts before the first layout, as on the desktop.
+        if let Some(dirs) = &dirs {
+            store::remove_leftovers(dirs);
+            store::load_fonts_and_dictionaries(dirs);
+        }
+        let files = dirs.as_ref().filter(|_| platform.is_some()).map(|d| Files::new(d.root()));
         let doc = if launch.sample { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
-        let mut app = WordApp::new(Session::new(doc), services(&clipboard));
-        // The ArtCraft brand licence (docs/brand/LICENSE-brand.txt) keeps its marks out of modified
-        // versions. This only hides the "Join the ArtCraft community" button by default: Options can still
-        // show it, and About still names ArtCraft (both need a hook in ui-egui, decided with the owner).
+        let mut app = WordApp::new(Session::new(doc), services(&clipboard, platform.as_ref(), files.as_ref(), dirs.as_ref()));
+        let mut recovery = None;
+        if let Some(dirs) = &dirs {
+            // A tablet follows the system's light or dark mode until the user picks one (File › Options).
+            if !store::load_prefs(dirs, &mut app) {
+                app.ui.theme = wordcraft_ui_egui::theme::Appearance::System;
+            }
+            let mut r = Recovery::new(dirs.recovery());
+            if let Some(message) = r.restore(&mut app) {
+                log::info!("{message}");
+                app.status(message);
+            }
+            recovery = Some(r);
+        }
+        // The ArtCraft brand licence (upstream's docs/brand/LICENSE-brand.txt) keeps its marks out of modified
+        // versions: the "Join the ArtCraft community" button stays hidden, whatever the settings say.
+        // About still names ArtCraft (that needs a hook in ui-egui).
         app.ui.show_discord = false;
-        Self {
+        let mut host = Self {
             ctx: new_context(),
             app,
             input: Translator::default(),
@@ -94,6 +160,102 @@ impl Host {
             focused: true,
             system_theme: None,
             max_texture_side: 2048,
+            dirs,
+            recovery,
+            platform,
+            files,
+            dropped: Vec::new(),
+            prompts: Prompts::default(),
+            about: About::default(),
+            cursor: None,
+            title: None,
+            back: None,
+            quitting: None,
+            ime: Ime::default(),
+            touch: None,
+            tapped: None,
+            field: None,
+            password: false,
+            ime_states: VecDeque::new(),
+        };
+        host.pump();
+        host
+    }
+
+    /// Keeps the recovery snapshot up to date; call after each frame and when [`Host::maintain`]'s time
+    /// comes. Returns when to call again.
+    pub fn maintain(&mut self, now: Instant) -> Option<Instant> {
+        self.recovery.as_mut()?.observe(&mut self.app, now)
+    }
+
+    /// The app is leaving the screen (Pause, Stop) or going away (Destroy) and may be killed without
+    /// warning: the settings and a snapshot of unsaved changes are written.
+    pub fn persist(&mut self) {
+        if let Some(r) = &mut self.recovery {
+            r.flush(&mut self.app);
+        }
+        if let Some(files) = &mut self.files {
+            files.save();
+        }
+        self.save_prefs();
+    }
+
+    /// A report from the platform.
+    pub fn event(&mut self, inbound: Inbound) {
+        if let Inbound::Ime { generation, state } = inbound {
+            self.ime_state(generation, state);
+            return;
+        }
+        if let Some(files) = &mut self.files {
+            match inbound {
+                Inbound::File(event) => files.event(event, &mut self.app),
+                Inbound::Incoming(docs) => {
+                    for picked in docs {
+                        files.event(FileEvent::Incoming { picked }, &mut self.app);
+                    }
+                }
+                Inbound::Ime { .. } => {}
+            }
+        }
+        self.pump();
+        self.ctx.request_repaint();
+    }
+
+    /// Whether the app may close now that it asked to (File › Exit): not while a document is being written
+    /// back, for up to `QUIT_WAIT`.
+    pub fn ready_to_quit(&mut self) -> bool {
+        let Some(files) = &self.files else { return true };
+        if !files.writing() {
+            return true;
+        }
+        // A write-back that doesn't finish is tried again at the next start (the copy here is kept).
+        let since = *self.quitting.get_or_insert_with(Instant::now);
+        since.elapsed() >= QUIT_WAIT
+    }
+
+    /// The user quit (File › Exit, or closing the document): the settings are written and nothing is kept
+    /// to recover, the user having saved or discarded the changes. Waits up to `timeout` for the files.
+    pub fn quit(&mut self, timeout: std::time::Duration) {
+        if let Some(files) = &mut self.files {
+            files.save();
+        }
+        self.save_prefs();
+        if let Some(r) = &mut self.recovery {
+            r.discard();
+        }
+        self.wait_for_files(timeout);
+    }
+
+    /// Waits up to `timeout` for the recovery snapshot to be written; whether it was.
+    pub fn wait_for_files(&self, timeout: std::time::Duration) -> bool {
+        self.recovery.as_ref().is_none_or(|r| r.wait(timeout))
+    }
+
+    fn save_prefs(&self) {
+        if let Some(dirs) = &self.dirs
+            && let Err(e) = store::save_prefs(dirs, &self.app)
+        {
+            log::error!("can't save the settings: {e}");
         }
     }
 
@@ -108,8 +270,9 @@ impl Host {
     pub fn reset_context(&mut self) {
         let prefs = self.app.prefs();
         let session = std::mem::replace(&mut self.app.session, Session::new(wordcraft_doc::Document::new()));
-        let mut app = WordApp::new(session, services(&self.clipboard));
+        let mut app = WordApp::new(session, services(&self.clipboard, self.platform.as_ref(), self.files.as_ref(), self.dirs.as_ref()));
         app.apply_prefs(prefs);
+        app.ui.show_discord = false;
         self.app = app;
         self.ctx = new_context();
         self.input = Translator::default();
@@ -126,10 +289,22 @@ impl Host {
         &self.app
     }
 
+    #[cfg(test)]
+    pub fn app_mut(&mut self) -> &mut WordApp {
+        &mut self.app
+    }
+
     /// The window appeared, changed or went away (`None`: frames are skipped until it's back).
     pub fn set_window(&mut self, window: Option<Window>) {
         if window.is_none() {
             self.input.reset(&mut self.events);
+        }
+        // The keyboard came up over the caret: show it.
+        if let (Some(old), Some(new)) = (self.window, window)
+            && new.height < old.height
+            && self.ime.active()
+        {
+            self.app.canvas.scroll_to_caret = true;
         }
         self.window = window;
     }
@@ -168,7 +343,87 @@ impl Host {
 
     pub fn motion(&mut self, m: &Motion<'_>) {
         let ppp = self.pixels_per_point();
+        let touch = matches!(m.tool, Tool::Finger | Tool::Stylus) && !m.mouse_source;
+        let at = m.pointers.first().map(|p| egui::pos2(p.x, p.y));
+        match m.action {
+            Action::Down | Action::ButtonPress => {
+                // A composition ends where it is before the caret moves.
+                let commit = self.ime.commit();
+                self.events.extend(commit);
+                self.touch = at.filter(|_| touch);
+            }
+            Action::Move => {
+                if let (Some(start), Some(at)) = (self.touch, at)
+                    && (at - start).length() / ppp > TAP_SLOP
+                {
+                    self.touch = None;
+                }
+            }
+            Action::Up => {
+                if let Some(start) = self.touch.take()
+                    && !m.canceled
+                {
+                    self.tapped = Some(start);
+                }
+            }
+            Action::PointerDown | Action::Cancel => self.touch = None,
+            _ => {}
+        }
         self.input.motion(m, ppp, &mut self.events);
+    }
+
+    /// A state from the on-screen keyboard (`generation`: the push it was based on).
+    pub fn ime_state(&mut self, generation: u32, state: ime::Buf) {
+        self.ime_states.push_back((generation, state));
+    }
+
+    /// The keyboard's action key (Done, Go…).
+    pub fn ime_action(&mut self) {
+        let events = self.ime.action();
+        self.events.extend(events);
+    }
+
+    /// Applies the keyboard's states until one changes something; the rest wait for the next frame
+    /// (unless they pile up: then all of them, rather than fall behind).
+    fn next_ime_states(&mut self) {
+        let backlog = self.ime_states.len() > IME_BACKLOG;
+        while let Some((generation, state)) = self.ime_states.pop_front() {
+            let events = self.ime.state(generation, state);
+            let changed = !events.is_empty() || self.ime.select_pending();
+            self.events.extend(events);
+            if changed && !backlog {
+                break;
+            }
+            if backlog {
+                // Its place is lost among the edits: the next push shows the keyboard where the caret is.
+                let _ = self.ime.take_select();
+            }
+        }
+    }
+
+    /// Sets the document's selection where the keyboard put it, now that the edits before it are in.
+    fn apply_ime_select(&mut self) {
+        let Some((anchor, focus)) = self.ime.take_select() else { return };
+        if !self.app.canvas.focused {
+            return;
+        }
+        let session = &mut self.app.session;
+        let from = session.sel.focus.clone();
+        if let (Some(anchor), Some(focus)) = (ime::walk(&session.doc, &from, anchor), ime::walk(&session.doc, &from, focus))
+            && let Err(e) = session.run("select.range", &json!({"anchor": anchor, "focus": focus}))
+        {
+            log::warn!("the keyboard's selection: {e}");
+        }
+    }
+
+    /// What the on-screen keyboard should do (show, hide, take new text).
+    pub fn take_ime_requests(&mut self) -> Vec<ime::Request> {
+        self.ime.take_requests()
+    }
+
+    /// The editor the keyboard should be set up as.
+    pub fn ime_editor(&self) -> ime::Editor {
+        self.ime.editor(self.password)
     }
 
     /// Android 12–13, whose touchpads send a tap-drag without a button (see `input.rs`).
@@ -182,18 +437,27 @@ impl Host {
     }
 
     pub fn key(&mut self, k: &KeyPress) {
-        let clipboard = &self.clipboard;
-        self.input.key(k, || Some(clipboard.borrow().clone()), &mut self.events);
+        if k.keycode == code::BACK && k.pressed && self.back.is_none() {
+            self.back = Some(BackState::of(&self.app, &self.ctx, self.host_open()));
+        }
+        // A key ends the keyboard's composition first, where it is.
+        if k.pressed && !keymap::is_modifier(k.keycode) {
+            let commit = self.ime.commit();
+            self.events.extend(commit);
+        }
+        let (clipboard, platform) = (&self.clipboard, &self.platform);
+        self.input.key(k, || clipboard_text(platform.as_ref(), clipboard), &mut self.events);
     }
 
     /// Whether input is waiting for a frame.
     pub fn has_events(&self) -> bool {
-        !self.events.is_empty()
+        !self.events.is_empty() || !self.ime_states.is_empty()
     }
 
     /// Runs one frame, or `None` without a window.
     pub fn frame(&mut self) -> Option<Frame> {
         let window = self.window?;
+        self.next_ime_states();
         let native = window.native_ppp();
         let ppp = self.pixels_per_point();
         let [left, top, right, bottom] = window.insets.map(|i| i as f32 / ppp);
@@ -215,29 +479,219 @@ impl Host {
             ViewportId::ROOT,
             ViewportInfo { native_pixels_per_point: Some(native), focused: Some(self.focused), minimized: Some(false), ..ViewportInfo::default() },
         );
+        raw.dropped_files = self.dropped.drain(..).map(|path| Arc::new(LocalFile(path)) as egui::DroppedFileHandle).collect();
         self.app.raw_input_hook(&mut raw);
-        let app = &mut self.app;
+        let (app, prompts, about, files, platform) = (&mut self.app, &mut self.prompts, &mut self.about, &mut self.files, self.platform.as_deref());
         let out = self.ctx.run_ui(raw, |ui| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
+            about.intercept(app);
             app.ui(ui);
+            about.intercept(app);
+            about.show(&ctx);
+            prompts.show(ui, app, files.as_mut(), platform);
         });
-        let mut urls = Vec::new();
+        self.apply_ime_select();
+        self.after_frame_ime(&out.platform_output);
         for command in out.platform_output.commands {
             match command {
-                OutputCommand::CopyText(text) => *self.clipboard.borrow_mut() = text,
-                OutputCommand::OpenUrl(url) => urls.push(url.url),
+                OutputCommand::CopyText(text) => {
+                    let system = self.platform.as_ref().and_then(|p| p.call("clipboardSet", json!({"text": text})));
+                    let taken = system.is_some_and(|v| v.get("ok").and_then(serde_json::Value::as_bool) == Some(true));
+                    if !taken && self.platform.is_some() {
+                        log::warn!("the system clipboard didn't take the copy: pasting it within the app");
+                    }
+                    *self.clipboard.borrow_mut() = Clip { text, own: !taken };
+                }
+                OutputCommand::OpenUrl(url) => {
+                    if let Some(p) = &self.platform {
+                        p.call("openUrl", json!({"url": url.url}));
+                    }
+                }
                 OutputCommand::CopyImage(_) => {}
             }
         }
+        // The document's name as the window's title: screen readers announce it, and freeform windows show it.
+        let title = self.app.title_stem();
+        if self.title.as_ref() != Some(&title) {
+            if let Some(p) = &self.platform {
+                p.call("title", json!({"title": title}));
+            }
+            self.title = Some(title);
+        }
+        let cursor = out.platform_output.cursor_icon;
+        if self.cursor != Some(cursor) {
+            self.cursor = Some(cursor);
+            if let Some(p) = &self.platform {
+                p.call("pointerIcon", json!({"type": platform::pointer_icon(cursor)}));
+            }
+        }
+        if let Some(before) = self.back.take()
+            && before == BackState::of(&self.app, &self.ctx, self.host_open())
+            && let Some(p) = &self.platform
+        {
+            // Back with nothing to close: the app goes to the background, as at any app's root.
+            p.call("moveTaskToBack", json!({}));
+        }
+        self.pump();
         let primitives = self.ctx.tessellate(out.shapes, out.pixels_per_point);
-        Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point, urls })
+        Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point })
+    }
+
+    /// Whether something the host shows itself is open (Back closes it).
+    fn host_open(&self) -> bool {
+        self.about.is_open() || self.prompts.is_open() || self.files.as_ref().is_some_and(|f| f.question().is_some())
+    }
+
+    /// Where the keyboard's text goes after this frame, and what's there.
+    fn after_frame_ime(&mut self, output: &egui::PlatformOutput) {
+        for event in &output.events {
+            let info = event.widget_info();
+            if info.typ == egui::WidgetType::TextEdit
+                && let Some(text) = &info.current_text_value
+            {
+                self.field = Some(text.clone());
+            }
+        }
+        let ppp = self.pixels_per_point();
+        let tap = self.tapped.take().map(|p| egui::pos2(p.x / ppp, p.y / ppp));
+        let (target, fresh, area) = match &output.ime {
+            None => (None, None, None),
+            Some(out) if self.app.canvas.focused => {
+                self.field = None;
+                if self.app.session.math.is_some() {
+                    (Some(Target::Equation), None, self.app.canvas.canvas_rect)
+                } else {
+                    let fresh = ime::Window::of_document(&self.app.session.doc, &self.app.session.sel);
+                    (Some(Target::Document), fresh, self.app.canvas.canvas_rect.or(Some(out.rect)))
+                }
+            }
+            Some(out) => {
+                // The caret as the field keeps it (a tap moves it without telling anyone).
+                let text = self.field.as_deref().unwrap_or("");
+                let len = text.chars().count();
+                let cursor =
+                    self.ctx.memory(|m| m.focused()).and_then(|id| egui::TextEdit::load_state(&self.ctx, id)).and_then(|s| s.cursor.char_range());
+                let (anchor, caret) = cursor.map_or((len, len), |r| (r.secondary.index.0, r.primary.index.0));
+                (Some(Target::Field), Some(ime::Window::of_field(text, anchor, caret)), Some(out.rect.expand(8.0)))
+            }
+        };
+        self.password = output.ime.as_ref().is_some_and(|o| o.purpose == egui::IMEPurpose::Password);
+        if target.is_none() {
+            self.field = None;
+        }
+        let tapped = tap.zip(area).is_some_and(|(p, r)| r.contains(p));
+        self.ime.after_frame(target, fresh, tapped);
+        // A composition typed before a push replaced it.
+        let typed = self.ime.take_events();
+        self.events.extend(typed);
+    }
+
+    /// Hands the platform what the documents need (pickers, copies, write-backs) and the app what came of
+    /// it (documents to open, messages).
+    fn pump(&mut self) {
+        let Some(files) = &mut self.files else { return };
+        files.after_frame(&mut self.app);
+        // A synchronous answer can produce more work: a few rounds at most.
+        for _ in 0..4 {
+            let ops = files.take_ops();
+            if ops.is_empty() {
+                break;
+            }
+            for op in ops {
+                let (name, args) = platform::file_op(&op);
+                let answer = self.platform.as_ref().and_then(|p| p.call(name, args));
+                if op == FileOp::ListGrants
+                    && let Some(uris) = answer.as_ref().and_then(platform::grants)
+                {
+                    files.event(FileEvent::Grants { uris }, &mut self.app);
+                }
+            }
+        }
+        self.dropped.extend(files.take_to_open());
+        if let Some(message) = files.take_notices().pop() {
+            self.app.status(message);
+        }
+        let now = self.ctx.input(|i| i.time);
+        for exported in files.take_exports() {
+            self.prompts.exported(exported, now);
+        }
+        if !self.dropped.is_empty() {
+            self.ctx.request_repaint();
+        }
     }
 
     /// Whether the app asked to quit (File › Close on the last document, or Exit).
     pub fn quit_requested(&self) -> bool {
         self.app.quit_requested
     }
+}
+
+/// What Back (sent as Esc) may close or end; when none of it changes, Back leaves the app.
+#[derive(PartialEq)]
+struct BackState {
+    /// The host's own About, questions and offers.
+    host: bool,
+    dialog: bool,
+    file_dialog: bool,
+    backstage: bool,
+    colors: bool,
+    popup: bool,
+    math: bool,
+    painter: bool,
+    read_mode: bool,
+    sel: wordcraft_engine::Selection,
+    modes: String,
+}
+
+impl BackState {
+    fn of(app: &WordApp, ctx: &egui::Context, host: bool) -> Self {
+        Self {
+            host,
+            dialog: app.dialog.is_some(),
+            file_dialog: app.file_dialog_open(),
+            backstage: app.ui.backstage,
+            colors: app.colors.is_some(),
+            popup: egui::Popup::is_any_open(ctx),
+            math: app.session.math.is_some(),
+            painter: app.session.painter.is_some(),
+            read_mode: app.session.view.read_mode,
+            sel: app.session.sel.clone(),
+            modes: format!("{:?} {:?}", app.session.view.draw.mode, app.ui.keytips),
+        }
+    }
+}
+
+/// A document handed to the app as a dropped file.
+#[derive(Debug)]
+struct LocalFile(PathBuf);
+
+impl egui::DroppedFile for LocalFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+/// The system clipboard's text, else what was copied in the app.
+fn clipboard_text(platform: Option<&Rc<dyn Platform>>, own: &Rc<RefCell<Clip>>) -> Option<String> {
+    let clip = own.borrow();
+    if clip.own && !clip.text.is_empty() {
+        return Some(clip.text.clone());
+    }
+    let system = platform.and_then(|p| p.call("clipboardGet", json!({}))).and_then(|v| v.get("text")?.as_str().map(str::to_owned));
+    system.or_else(|| Some(clip.text.clone())).filter(|t| !t.is_empty())
+}
+
+/// The app's own copy of the clipboard.
+#[derive(Default)]
+struct Clip {
+    text: String,
+    /// The system clipboard didn't take it: it's newer than what the system holds.
+    own: bool,
 }
 
 /// egui as eframe sets it up on a phone or tablet: one window, so viewports are embedded, and up to two
@@ -249,26 +703,52 @@ fn new_context() -> egui::Context {
     ctx
 }
 
-fn services(clipboard: &Rc<RefCell<String>>) -> Services {
-    Services {
-        // No system file dialog yet: the app's own file browser opens instead (an `Err` answer).
-        file_dialog: Some(Box::new(|_| {
+fn services(clipboard: &Rc<RefCell<Clip>>, platform: Option<&Rc<dyn Platform>>, files: Option<&Files>, dirs: Option<&Dirs>) -> Services {
+    let file_dialog: Box<dyn Fn(_) -> _> = match files {
+        // The system's picker, through the documents' mirrors (`files.rs`).
+        Some(files) => {
+            let dialogs = files.dialogs();
+            Box::new(move |req| crate::files::Dialogs::ask(&dialogs, req))
+        }
+        // No platform: the app's own file browser (an `Err` answer).
+        None => Box::new(|_| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = tx.send(Err("Android has no file dialog in this version".to_owned()));
+            let _ = tx.send(Err("no system file dialog".to_owned()));
             rx
-        })),
+        }),
+    };
+    let print = platform.zip(dirs).map(|(platform, dirs)| {
+        let (platform, dir) = (Rc::clone(platform), dirs.print());
+        Box::new(move |pdf: &[u8]| print(platform.as_ref(), &dir, pdf)) as Box<dyn Fn(&[u8]) -> Result<(), String>>
+    });
+    Services {
+        file_dialog: Some(file_dialog),
         clipboard_text: Some(Box::new({
-            let clipboard = Rc::clone(clipboard);
-            move || Some(clipboard.borrow().clone()).filter(|t| !t.is_empty())
+            let (clipboard, platform) = (Rc::clone(clipboard), platform.cloned());
+            move || clipboard_text(platform.as_ref(), &clipboard)
         })),
+        print,
         ..Services::default()
+    }
+}
+
+/// File › Print: the PDF goes to Android's print service, which shows its own dialog (printers, Save as
+/// PDF). Earlier print files are deleted (the print service reads the file only while its dialog is open).
+fn print(platform: &dyn Platform, dir: &Path, pdf: &[u8]) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dir);
+    let path = dir.join("document.pdf");
+    store::write_atomic(&path, pdf).map_err(|e| e.to_string())?;
+    match platform.call("print", json!({"path": path.to_string_lossy(), "name": "Folio Writer document"})) {
+        Some(v) if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => Ok(()),
+        _ => Err("printing isn't available".to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{Action, Pointer, Tool};
+    use crate::ime::char_to_utf16;
+    use crate::input::Pointer;
     use crate::keymap::{code, meta};
     use wordcraft_doc::StoryRef;
 
@@ -285,7 +765,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        let mut host = Host::new(&Launch { sample: true });
+        let mut host = Host::new(&Launch { sample: true }, None, None);
         host.set_window(Some(tablet()));
         host.set_max_texture_side(8192);
         host
@@ -301,7 +781,7 @@ mod tests {
 
     #[test]
     fn no_window_no_frame() {
-        let mut host = Host::new(&Launch::default());
+        let mut host = Host::new(&Launch::default(), None, None);
         assert!(step(&mut host).is_none());
         host.set_window(Some(tablet()));
         assert!(step(&mut host).is_some());
@@ -404,5 +884,247 @@ mod tests {
         }
         host.set_focused(false);
         step(&mut host);
+    }
+
+    /// Android, as far as the host can tell: records the calls, answers the clipboard.
+    #[derive(Default)]
+    struct Fake {
+        calls: RefCell<Vec<(String, serde_json::Value)>>,
+        clipboard: RefCell<Option<String>>,
+        /// The longest text the clipboard takes (`None`: any).
+        clip_max: std::cell::Cell<Option<usize>>,
+    }
+
+    impl Platform for Fake {
+        fn call(&self, op: &str, args: serde_json::Value) -> Option<serde_json::Value> {
+            self.calls.borrow_mut().push((op.to_owned(), args.clone()));
+            match op {
+                "clipboardGet" => self.clipboard.borrow().as_ref().map(|t| json!({"text": t})),
+                "clipboardSet" => {
+                    let text = args.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                    if self.clip_max.get().is_some_and(|max| text.len() > max) {
+                        return Some(json!({"ok": false}));
+                    }
+                    *self.clipboard.borrow_mut() = Some(text.to_owned());
+                    Some(json!({"ok": true}))
+                }
+                "grants" => Some(json!({"uris": []})),
+                "print" => Some(json!({"ok": true})),
+                _ => None,
+            }
+        }
+    }
+
+    impl Fake {
+        fn ops(&self, op: &str) -> Vec<serde_json::Value> {
+            self.calls.borrow().iter().filter(|(o, _)| o == op).map(|(_, a)| a.clone()).collect()
+        }
+    }
+
+    fn android(dirs: Option<Dirs>) -> (Host, Rc<Fake>) {
+        android_with(dirs, true)
+    }
+
+    fn android_with(dirs: Option<Dirs>, sample: bool) -> (Host, Rc<Fake>) {
+        let fake = Rc::new(Fake::default());
+        let mut host = Host::new(&Launch { sample }, dirs, Some(Rc::clone(&fake) as Rc<dyn Platform>));
+        host.set_window(Some(tablet()));
+        host.set_max_texture_side(8192);
+        for _ in 0..3 {
+            step(&mut host);
+        }
+        (host, fake)
+    }
+
+    fn press(host: &mut Host, keycode: u32, meta_state: u32) {
+        host.sync_modifiers(meta_state);
+        host.key(&KeyPress { keycode, meta_state, pressed: true, typed: None });
+        host.key(&KeyPress { keycode, meta_state, pressed: false, typed: None });
+        step(host);
+    }
+
+    #[test]
+    fn copy_and_paste_use_the_system_clipboard() {
+        let (mut host, fake) = android(None);
+        press(&mut host, code::A, meta::CTRL_ON);
+        press(&mut host, code::A + 2, meta::CTRL_ON);
+        let copied = fake.clipboard.borrow().clone().expect("copied to the system clipboard");
+        assert!(copied.len() > 100);
+        // Text copied in another app is pasted.
+        *fake.clipboard.borrow_mut() = Some("from another app".into());
+        press(&mut host, code::A + 21, meta::CTRL_ON);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("from another app"));
+        // Too large for the system clipboard: the app pastes its own copy, not the older text in the system's.
+        fake.clip_max.set(Some(5));
+        press(&mut host, code::A, meta::CTRL_ON);
+        press(&mut host, code::A + 2, meta::CTRL_ON);
+        assert_eq!(fake.clipboard.borrow().as_deref(), Some("from another app"));
+        let all = host.app().session.doc.plain_text(StoryRef::Body);
+        press(&mut host, code::A + 21, meta::CTRL_ON);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).len() >= all.len(), "pasted over the selection with the same text");
+        assert_eq!(fake.ops("clipboardGet").len(), 1, "the system clipboard isn't asked while the app's copy is newer");
+    }
+
+    #[test]
+    fn back_closes_what_is_open_else_leaves_the_app() {
+        let (mut host, fake) = android(None);
+        host.app_mut().ui.backstage = true;
+        step(&mut host);
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert!(!host.app().ui.backstage, "Back closed the backstage");
+        assert!(fake.ops("moveTaskToBack").is_empty());
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert_eq!(fake.ops("moveTaskToBack").len(), 1, "nothing open: the app goes to the background");
+    }
+
+    #[test]
+    fn the_pointer_shape_is_sent_when_it_changes() {
+        let (mut host, fake) = android(None);
+        let sent = fake.ops("pointerIcon").len();
+        assert_eq!(sent, 1, "once at the start");
+        for _ in 0..3 {
+            step(&mut host);
+        }
+        assert_eq!(fake.ops("pointerIcon").len(), sent, "not again while it stays");
+    }
+
+    #[test]
+    fn a_document_sent_to_the_app_opens() {
+        let root = crate::store::tests::temp_dir("host-incoming");
+        let (mut host, fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(fake.ops("grants").len(), 1);
+        host.event(Inbound::Incoming(vec![crate::files::Picked {
+            uri: "content://x/doc/1".into(),
+            name: "Minutes.docx".into(),
+            writable: true,
+            ..Default::default()
+        }]));
+        let copy = fake.ops("copyIn").pop().expect("copied in");
+        let path = PathBuf::from(copy["path"].as_str().unwrap());
+        // Android copies it.
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        s.run("text.insert", &json!({"text": "Minutes of the meeting"})).unwrap();
+        wordcraft_engine::io::save_path_with(&path, &s.doc, None, &Default::default()).unwrap();
+        let req = copy["req"].as_u64().unwrap();
+        host.event(platform::parse(&json!({"event": "copiedIn", "req": req, "remote": {"size": 1}}).to_string()).unwrap());
+        step(&mut host);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("Minutes of the meeting"));
+        assert_eq!(host.app().session.path.as_deref(), Some(path.as_path()));
+        // Saving writes it back to Android's document.
+        press(&mut host, code::A + 18, meta::CTRL_ON);
+        assert!(fake.ops("writeBack").iter().any(|w| w["uri"] == "content://x/doc/1"), "{:?}", fake.calls.borrow());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn tap(host: &mut Host, x: f32, y: f32) {
+        let p = [Pointer { id: 0, x, y, pressure: 1.0 }];
+        for action in [Action::Down, Action::Up] {
+            let m = Motion {
+                mouse_source: false,
+                tool: Tool::Finger,
+                device_id: 2,
+                action,
+                index: 0,
+                canceled: false,
+                no_focus_change: false,
+                pointers: &p,
+                buttons: 0,
+                scroll: egui::Vec2::ZERO,
+                meta_state: 0,
+            };
+            host.motion(&m);
+            step(host);
+        }
+    }
+
+    #[test]
+    fn the_on_screen_keyboard_types_into_the_document() {
+        // A blank document: a tap anywhere on the page puts the caret in its one paragraph, whatever the fonts.
+        let (mut host, _fake) = android_with(None, false);
+        host.app_mut().run("text.insert", json!({"text": "Hello"})).unwrap();
+        step(&mut host);
+        host.take_ime_requests();
+        tap(&mut host, 1280.0, 700.0);
+        step(&mut host);
+        let requests = host.take_ime_requests();
+        assert!(requests.contains(&ime::Request::Show), "{requests:?}");
+        let Some(ime::Request::Push { text, focus, generation, .. }) = requests.iter().find(|r| matches!(r, ime::Request::Push { .. })).cloned()
+        else {
+            panic!("{requests:?}")
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let c = ime::utf16_to_char(&chars, i64::try_from(focus).unwrap());
+        let (before, after): (String, String) = (chars[..c].iter().collect(), chars[c..].iter().collect());
+        let at = |n: usize| i64::try_from(char_to_utf16(&chars, c) + n).unwrap();
+        // Composing "Zeb", then "Zebra " typed.
+        host.ime_state(generation, ime::normalize(&format!("{before}Zeb{after}"), (at(3), at(3)), Some((at(0), at(3)))));
+        step(&mut host);
+        assert_eq!(host.app().canvas.ime_preedit, "Zeb");
+        host.ime_state(generation, ime::normalize(&format!("{before}Zebra {after}"), (at(6), at(6)), None));
+        step(&mut host);
+        assert!(host.app().canvas.ime_preedit.is_empty());
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("Zebra "), "typed into the document");
+        assert!(host.app().session.can_undo());
+        // What the keyboard holds still matches the document: no push.
+        step(&mut host);
+        assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })));
+        // The keyboard moves the caret back over the word and types: both reports arrive before a frame,
+        // and the letter still goes where the caret went.
+        host.ime_state(generation, ime::normalize(&format!("{before}Zebra {after}"), (at(0), at(0)), None));
+        host.ime_state(generation, ime::normalize(&format!("{before}QZebra {after}"), (at(1), at(1)), None));
+        step(&mut host);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("QZebra "), "{}", host.app().session.doc.plain_text(StoryRef::Body));
+        assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })), "still in step");
+        // A mouse click elsewhere ends nothing and doesn't bring the keyboard back; hardware typing goes on.
+        press(&mut host, code::A + 25, 0);
+    }
+
+    #[test]
+    fn the_interface_follows_the_system_until_the_user_picks() {
+        let root = crate::store::tests::temp_dir("host-theme");
+        let (mut host, _fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(host.app().ui.theme, wordcraft_ui_egui::theme::Appearance::System);
+        host.set_system_theme(Some(Theme::Dark));
+        step(&mut host);
+        assert!(host.app().ui_is_dark());
+        host.set_system_theme(Some(Theme::Light));
+        step(&mut host);
+        assert!(!host.app().ui_is_dark());
+        // The user's choice is kept.
+        host.app_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
+        host.persist();
+        drop(host);
+        let (host, _fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(host.app().ui.theme, wordcraft_ui_egui::theme::Appearance::Dark);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn about_shows_folio_writer() {
+        let (mut host, _fake) = android(None);
+        host.app_mut().run("ui.dialog", json!({"name": "about"})).unwrap();
+        step(&mut host);
+        assert!(host.app().dialog.is_none(), "the app's own About doesn't show");
+        assert!(host.about.is_open());
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert!(!host.about.is_open(), "Back closes it");
+    }
+
+    #[test]
+    fn printing_hands_a_pdf_to_android() {
+        let root = crate::store::tests::temp_dir("host-print");
+        let (mut host, fake) = android(Some(Dirs::new(&root)));
+        host.app_mut().run("ui.print", json!({})).unwrap();
+        let print = fake.ops("print").pop().expect("print");
+        let pdf = std::fs::read(print["path"].as_str().unwrap()).unwrap();
+        assert!(pdf.starts_with(b"%PDF"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

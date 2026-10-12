@@ -23,13 +23,16 @@ type_complexity = "allow"
 # Loaded by the activity as `libwordcraft_android.so`.
 crate-type = ["cdylib"]
 
-# The platform-independent host (`host.rs`, `input.rs`, `keymap.rs`) builds and is tested everywhere.
+# The platform-independent host (`host.rs`, `input.rs`, `keymap.rs`, `store.rs`, `recovery.rs`) builds
+# and is tested everywhere.
 [dependencies]
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
+wordcraft-fonts = { workspace = true }
 wordcraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # The activity glue (GameActivity 4.4.0 on the Java side; its text input is what the IME work builds on),

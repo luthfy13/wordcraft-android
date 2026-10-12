@@ -37,7 +37,7 @@ const BUTTONS: [(u32, PointerButton); 5] = [
 const CANCEL_NUDGE: f32 = 16.0;
 
 /// How far (points) a touchpad's two fingers may drift and still make a tap (a click).
-const TAP_SLOP: f32 = 8.0;
+pub(crate) const TAP_SLOP: f32 = 8.0;
 
 /// `AMOTION_EVENT_FLAG_NO_FOCUS_CHANGE`: on Android 12–13 touchpads, set on two-finger gestures and never on
 /// a tap or tap-drag, which arrive in the same shape (one finger, no button).

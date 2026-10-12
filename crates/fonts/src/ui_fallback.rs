@@ -76,6 +76,10 @@ fn probe(hans: bool) -> char {
 fn candidates(hans: bool) -> Vec<&'static str> {
     let (zh, ja): (&[&str], &[&str]) = if cfg!(windows) {
         (&["Deng.ttf", "msyh.ttc", "simhei.ttf", "simsun.ttc", "NotoSansSC-VF.ttf"], &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"])
+    } else if cfg!(target_os = "android") {
+        // One pan-CJK collection in /system/fonts on Android 10 and later (JP, KR, SC, TC and HK
+        // faces; variable from Android 16): `pick_face` takes the SC face for Chinese.
+        (&["NotoSansCJK-Regular.ttc", "NotoSerifCJK-Regular.ttc"], &[])
     } else if cfg!(target_os = "macos") {
         (
             &[

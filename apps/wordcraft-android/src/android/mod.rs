@@ -4,20 +4,26 @@
 //! Every Android call happens on the `android_main` thread. Calls that take android-activity's write
 //! lock (`enable_motion_axis`) are made before the loop: inside `poll_events` they would deadlock.
 
+mod bridge;
 mod entry;
 mod gfx;
 mod keychars;
 
+use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{Axis, InputEvent, KeyAction, KeyEvent, MotionAction, MotionEvent, ToolType};
+use android_activity::input::{Axis, ImeOptions, InputEvent, InputType, KeyAction, KeyEvent, MotionAction, MotionEvent, TextInputAction, ToolType};
 use android_activity::{AndroidApp, AndroidAppWaker, InputStatus, MainEvent, PollEvent};
 use ndk::configuration::UiModeNight;
 use ndk::native_window::NativeWindow;
 
 use crate::host::{Host, Launch, Window};
+use crate::ime;
 use crate::input::{Action, FLAG_NO_FOCUS_CHANGE, KeyPress, Motion, Pointer, Tool};
+use crate::platform::{self, Platform, inbox};
+use crate::store::Dirs;
 use gfx::{Backend, Gpu, PaintJob, Painted, WindowSurface};
 use keychars::KeyChars;
 
@@ -28,6 +34,11 @@ const FLAG_CANCELED: u32 = 0x20;
 /// Waits before attaching a window again after attaching failed: doubling from the first to the last.
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(8);
+/// How long leaving waits for the settings and the recovery snapshot to reach storage.
+const FILES_WAIT: Duration = Duration::from_secs(2);
+/// Panics in frames this close together end the app (the next start recovers the document).
+const PANIC_WINDOW: Duration = Duration::from_secs(60);
+const PANICS_MAX: usize = 3;
 
 pub(crate) fn main(app: AndroidApp) {
     init_logging();
@@ -36,8 +47,22 @@ pub(crate) fn main(app: AndroidApp) {
     // The wheel's axes are off by default.
     app.enable_motion_axis(Axis::Vscroll);
     app.enable_motion_axis(Axis::Hscroll);
+    platform::saved::set_running(true);
     let mut state = State::new(app, &args);
-    state.run();
+    // A panic outside a frame (input, a report from Android, upkeep): the document is still saved below.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| state.run())).is_err() {
+        log::error!("the event loop panicked: keeping the document for the next start");
+    }
+    inbox::set_waker(None);
+    if state.host.quit_requested() {
+        state.host.quit(FILES_WAIT);
+    } else {
+        state.host.persist();
+        if !state.host.wait_for_files(FILES_WAIT) {
+            log::warn!("the recovery snapshot wasn't written in time");
+        }
+    }
+    platform::saved::set_running(false);
     log::info!("Folio Writer stopping");
 }
 
@@ -124,6 +149,12 @@ struct State {
     presented: u32,
     /// When `android_main` started: the first frame's log line says how long it took.
     started: Instant,
+    /// When the host's upkeep (the recovery snapshot) is next due.
+    upkeep: Option<Instant>,
+    /// When frames panicked lately.
+    panics: Vec<Instant>,
+    /// The keyboard's settings last sent.
+    ime_editor: Option<ime::Editor>,
     /// Debug builds: `--panic-test` panics after the first frames, so CI sees a panic reach logcat.
     #[cfg(debug_assertions)]
     panic_test: bool,
@@ -132,11 +163,15 @@ struct State {
 impl State {
     fn new(app: AndroidApp, args: &str) -> Self {
         let repaint = Arc::new(Repaint { at: Mutex::new(None), waker: app.create_waker() });
+        // Kotlin's reports wake the loop (and any that came before it are picked up).
+        let waker = app.create_waker();
+        inbox::set_waker(Some(Arc::new(move || waker.wake())));
+        let platform: Rc<dyn Platform> = Rc::new(bridge::AndroidPlatform);
         let mut state = Self {
             surface: None,
             gpu: None,
             window: None,
-            host: Host::new(&Launch::parse(args)),
+            host: Host::new(&Launch::parse(args), app.internal_data_path().map(|p| Dirs::new(&p)), Some(platform)),
             repaint,
             backend: Backend::parse(args),
             keys: KeyChars::default(),
@@ -150,6 +185,9 @@ impl State {
             skips: 0,
             presented: 0,
             started: Instant::now(),
+            upkeep: None,
+            panics: Vec::new(),
+            ime_editor: None,
             #[cfg(debug_assertions)]
             panic_test: args.split_whitespace().any(|a| a == "--panic-test"),
             app,
@@ -171,6 +209,8 @@ impl State {
             let app = self.app.clone();
             app.poll_events(self.timeout(), |event| self.on_event(event));
             // Without draining every time, no further input arrives.
+            // The keyboard's states before keys and taps, which commit a composition the states describe.
+            self.drain_inbox();
             self.drain_input();
             if self.quit {
                 break;
@@ -180,28 +220,44 @@ impl State {
                 self.attach();
             }
             let due = self.repaint.take_due(now);
+            let mut framed = false;
             if self.surface.is_some() && (self.redraw || due || self.host.has_events()) {
                 self.redraw = false;
                 self.frame();
+                framed = true;
             }
-            if self.host.quit_requested() {
-                // Returning from `android_main` finishes the activity.
+            if framed {
+                self.ime_requests();
+            }
+            let now = Instant::now();
+            if framed || self.upkeep.is_some_and(|t| t <= now) {
+                self.upkeep = self.host.maintain(now);
+            }
+            if self.quit {
                 break;
+            }
+            // Returning from `android_main` finishes the activity, once documents are written back.
+            if self.host.quit_requested() {
+                if self.host.ready_to_quit() {
+                    break;
+                }
+                // Looks again when a write-back reports, or soon.
+                self.repaint.request(Duration::from_millis(250));
             }
         }
     }
 
-    /// How long to wait for events: not at all when a frame is due, until egui's next repaint, or, with
-    /// nothing to draw on, until the next attempt to attach the window (or indefinitely).
+    /// How long to wait for events: not at all when a frame is due, else until egui's next repaint (with a
+    /// surface) or the next attempt to attach the window (without), or the host's upkeep, whichever
+    /// comes first. With none of these, indefinitely.
     fn timeout(&self) -> Option<Duration> {
         let now = Instant::now();
-        if self.surface.is_none() {
-            return self.retry.map(|t| whole_ms(t.saturating_duration_since(now)));
-        }
-        if self.redraw || self.host.has_events() {
+        if self.surface.is_some() && (self.redraw || self.host.has_events()) {
             return Some(Duration::ZERO);
         }
-        self.repaint.wait(now).map(whole_ms)
+        let next = if self.surface.is_some() { self.repaint.wait(now) } else { self.retry.map(|t| t.saturating_duration_since(now)) };
+        let upkeep = self.upkeep.map(|t| t.saturating_duration_since(now));
+        next.into_iter().chain(upkeep).min().map(whole_ms)
     }
 
     fn on_event(&mut self, event: PollEvent<'_>) {
@@ -232,6 +288,14 @@ impl State {
                 self.redraw = true;
             }
             MainEvent::LowMemory => log::info!("the system is low on memory"),
+            // The app may be killed from here on without another word.
+            MainEvent::Pause => self.host.persist(),
+            // `onStop` waits for this (`platform::saved`).
+            MainEvent::Stop => {
+                self.host.persist();
+                self.host.wait_for_files(Duration::from_millis(1400));
+                platform::saved::done();
+            }
             MainEvent::Destroy => self.quit = true,
             _ => {}
         }
@@ -317,10 +381,12 @@ impl State {
     }
 
     fn frame(&mut self) {
-        let Some(mut frame) = self.host.frame() else { return };
-        for url in &frame.urls {
-            log::info!("opening links comes in a later version: {url}");
-        }
+        // A panic in the app's interface code: the document survives, the interface starts again.
+        let frame = match std::panic::catch_unwind(AssertUnwindSafe(|| self.host.frame())) {
+            Ok(frame) => frame,
+            Err(_) => return self.after_panic(),
+        };
+        let Some(mut frame) = frame else { return };
         let Some(gpu) = self.gpu.as_mut() else {
             // Textures no renderer saw: the next device needs a new egui context.
             frame.textures.clear();
@@ -365,6 +431,91 @@ impl State {
         }
     }
 
+    /// After a frame panicked (the hook logged it): a snapshot of the document first, then a new egui
+    /// context and graphics device, as after a lost device. Panics in a row end the app.
+    fn after_panic(&mut self) {
+        self.host.persist();
+        let now = Instant::now();
+        self.panics.retain(|t| now.duration_since(*t) < PANIC_WINDOW);
+        self.panics.push(now);
+        if self.panics.len() >= PANICS_MAX {
+            log::error!("the interface panicked {} times in a minute: closing (the document is kept for the next start)", self.panics.len());
+            self.quit = true;
+            return;
+        }
+        log::error!("the interface panicked: starting it again");
+        self.drop_surface();
+        gfx::drop_guarded(self.gpu.take());
+        self.had_gpu = true;
+        self.attach();
+    }
+
+    /// The on-screen keyboard: shown and hidden through GameActivity, its text set through the activity
+    /// (which tags the keyboard's states with the push they follow). Never inside `poll_events`.
+    fn ime_requests(&mut self) {
+        for request in self.host.take_ime_requests() {
+            match request {
+                ime::Request::Show => {
+                    self.ime_editor_info();
+                    self.app.show_soft_input(false);
+                }
+                ime::Request::Hide => self.app.hide_soft_input(false),
+                ime::Request::Push { text, anchor, focus, generation } => {
+                    self.ime_editor_info();
+                    let args = serde_json::json!({"text": text, "anchor": anchor, "focus": focus, "generation": generation});
+                    bridge::AndroidPlatform.call("imePush", args);
+                }
+            }
+        }
+    }
+
+    /// A multi-line editor with suggestions and sentence capitals, Enter typing a new line, never
+    /// full-screen; for a password, no suggestions and no learning; for an equation, no capitals and no
+    /// corrections.
+    fn ime_editor_info(&mut self) {
+        let editor = self.host.ime_editor();
+        if self.ime_editor == Some(editor) {
+            return;
+        }
+        self.ime_editor = Some(editor);
+        let fixed = ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI;
+        let (input_type, options) = match editor {
+            ime::Editor::Password => (
+                InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_PASSWORD | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                fixed | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING,
+            ),
+            ime::Editor::Raw => (
+                InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                fixed | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
+            ),
+            ime::Editor::Text => (
+                InputType::TYPE_CLASS_TEXT
+                    | InputType::TYPE_TEXT_FLAG_MULTI_LINE
+                    | InputType::TYPE_TEXT_FLAG_CAP_SENTENCES
+                    | InputType::TYPE_TEXT_FLAG_AUTO_CORRECT,
+                fixed | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
+            ),
+        };
+        self.app.set_ime_editor_info(input_type, TextInputAction::None, options);
+    }
+
+    /// Kotlin's reports (pickers, copies, write-backs, documents sent to the app).
+    fn drain_inbox(&mut self) {
+        let (reports, dropped) = inbox::take();
+        if dropped > 0 {
+            log::warn!("{dropped} reports from Android were dropped");
+        }
+        for report in reports {
+            match platform::parse(&report) {
+                Some(inbound) => {
+                    self.host.event(inbound);
+                    self.redraw = true;
+                }
+                None => log::warn!("a report from Android this version doesn't know"),
+            }
+        }
+    }
+
     fn drain_input(&mut self) {
         let app = self.app.clone();
         let mut events = match app.input_events_iter() {
@@ -395,7 +546,9 @@ impl State {
                     seen(m.event_time(), m.meta_state().0);
                     self.on_motion(m);
                 }
-                // The soft keyboard's text comes in the next phase.
+                InputEvent::TextAction(_) if live => self.host.ime_action(),
+                // The keyboard's states come through `MainActivity.stateChanged` (the inbox) instead:
+                // GameTextInput's own copy is cut at 64 KiB.
                 _ => {}
             }
             InputStatus::Handled
