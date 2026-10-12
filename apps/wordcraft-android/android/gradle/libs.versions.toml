@@ -1,0 +1,15 @@
+[versions]
+agp = "9.4.1"
+# android-activity 0.6.1 bundles the native half of GameActivity 4.4.0: the Java half must match exactly.
+gamesActivity = "4.4.0"
+# GameActivity extends AppCompatActivity but doesn't declare AppCompat. core 1.19 needs compileSdk 37.
+appcompat = "1.7.1"
+core = "1.18.0"
+
+[libraries]
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
+androidx-core = { module = "androidx.core:core", version.ref = "core" }
+androidx-games-activity = { module = "androidx.games:games-activity", version.ref = "gamesActivity" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }

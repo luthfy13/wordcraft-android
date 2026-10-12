@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Original artwork (MIT OR Apache-2.0), 108 dp adaptive-icon canvas; the safe zone is the middle 66 dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- The page, its top right corner folded. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M36,30 L64,30 L74,40 L74,78 L36,78 Z" />
+    <path
+        android:fillColor="#FFB9D3DE"
+        android:pathData="M64,30 L74,40 L64,40 Z" />
+    <!-- Lines of text. -->
+    <path
+        android:fillColor="#FF1F5F7A"
+        android:pathData="M42,46 L68,46 L68,49 L42,49 Z M42,53 L68,53 L68,56 L42,56 Z M42,60 L68,60 L68,63 L42,63 Z M42,67 L58,67 L58,70 L42,70 Z" />
+</vector>

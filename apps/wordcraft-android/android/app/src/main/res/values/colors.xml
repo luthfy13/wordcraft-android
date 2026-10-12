@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Behind the system bars: close to the app's light and dark panels. -->
+    <color name="window_background">#FFF3F3F3</color>
+    <color name="ic_launcher_background">#FF1F5F7A</color>
+</resources>

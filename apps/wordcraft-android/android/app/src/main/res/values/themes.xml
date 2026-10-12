@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- GameActivity is an AppCompatActivity. Dark icons on the light bars, light ones at night. -->
+    <style name="Theme.FolioWriter" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>
