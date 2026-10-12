@@ -7,32 +7,66 @@ Not a WebView and not WASM: the same Rust `WordApp` as the desktop, drawn with w
 - minSdk 29 (Android 10), targetSdk 36 (what Google Play requires since 31 August 2026).
 - Ships `arm64-v8a`; CI adds `x86_64` for the emulator.
 
-## Status (phase 1: a minimal build that runs)
+## Status (phase 2: Android integration)
 
-Built and checked: unit tests on Linux, clippy for Linux and Android, the debug APK, 16 KB alignment, and
-(in CI) an emulator smoke test. Not yet run on a tablet. In this phase:
+Built and checked: unit tests on Linux (the host, files, recovery, keyboard and protocol logic), clippy for
+Linux and Android, the debug APK, 16 KB alignment, and (in CI) emulator smoke tests on API 34 and 36:
+both graphics backends, the system fonts, recovery after a kill, text shared with the app, and a panic
+reaching logcat. **Not yet run on a tablet**: the checklist in the phase report covers what needs one.
 
-- Typing needs a hardware keyboard: the on-screen keyboard and IME composition come in phase 2.
-- Copy and paste work inside the app only; the system clipboard, file dialogs (the app's own file browser
-  opens instead), opening links, sharing and printing come in phase 2.
-- Back closes what's open, like Esc; the app doesn't quit on it.
+What works, through Android's own services:
+
+- **Files.** Open, Save As, Export and Save as PDF use the system's document picker. Each document has a
+  copy in the app's storage that the app opens and saves as on the desktop (AutoSave included); every save
+  is written back to the document, and its permission is kept, so Recent opens it again after a restart.
+  A document changed elsewhere asks before it's replaced; one that can't be written (read-only, permission
+  gone) stays marked unsaved and asks where to save. Open with, Edit and Share (documents, pictures, text)
+  open in the app.
+- **No lost work.** Settings (`ui.json`) are written atomically. While a document has unsaved changes a
+  snapshot is written (after a pause in editing, at least every 30 s, and when the app leaves the screen,
+  which `onStop` waits for); the next start brings it back after a kill or crash. A panic in the interface
+  keeps the document and starts the interface again.
+- **Typing.** Hardware keyboards as on the desktop (Word's shortcuts, Shift and Ctrl with arrows, dead
+  keys). The on-screen keyboard types into the document with composition (CJK, Korean, suggestions,
+  AutoCorrect, swipe); a tap on the page or a field shows it.
+- **Clipboard** (plain text, both ways; rich formatting stays within the app, as on the desktop),
+  **printing** through Android's print service, **sharing** an exported file, **links**, the mouse
+  **pointer's shapes**, **Back** (closes what's open; with nothing open the app goes to the background).
+- **Fonts and look.** Android's system fonts (CJK, Arabic and the other scripts), a monochrome emoji
+  fallback, the interface following the system's light or dark mode until the user picks one.
+- **About** shows Folio Writer, the licences of everything it ships and WordCraft's contributors.
+
+Known limits: colour emoji draw in PDFs but not on screen (monochrome there); TalkBack sees the window but
+not the app's controls yet; Read Aloud needs a speech engine hook; the interface still says "WordCraft" in
+some places.
 
 ## How it fits together
 
 | Part | What it does |
 |---|---|
-| `src/host.rs` | Owns egui's context and the `WordApp`; runs a frame the way eframe does (`raw_input_hook`, then `logic` and `ui`). No Android or GPU types: tested on Linux. |
-| `src/input.rs`, `src/keymap.rs` | Android touch, mouse, touchpad, stylus and key events → egui events (modifiers, Cut/Copy/Paste keys, text, dead keys). Tested on Linux. |
+| `src/host.rs` | Owns egui's context and the `WordApp`; runs a frame the way eframe does (`raw_input_hook`, then `logic` and `ui`), then hands the platform what the frame asked for. No Android or GPU types: tested on Linux with a fake platform. |
+| `src/input.rs`, `src/keymap.rs` | Android touch, mouse, touchpad, stylus and key events → egui events (modifiers, Cut/Copy/Paste keys, text, dead keys). |
+| `src/ime.rs` | The on-screen keyboard: the text around the caret it's given, and its edits turned into keys and text. |
+| `src/files.rs` | Documents in Android's storage: pickers, copies, write-backs, Recent. |
+| `src/recovery.rs`, `src/store.rs` | Recovery snapshots; settings and the app's folders, written atomically. |
+| `src/platform.rs` | The JSON calls into Kotlin and the reports back, and the queue the loop drains. |
+| `src/about.rs`, `src/prompts.rs` | What the host shows itself: About and licences; the conflict question and the share offer. |
 | `src/android/mod.rs` | The event loop on `android-activity` (GameActivity): window and lifecycle, input, frames only when egui asks for one. |
 | `src/android/gfx.rs` | wgpu: Vulkan, falling back to OpenGL ES; every call that can panic is guarded. |
-| `src/android/keychars.rs` | The characters keys type, from Android's key character maps (safe JNI). |
-| `src/android/entry.rs` | The two exported symbols (`android_main`, `MainActivity.nativeSetLaunchArgs`). |
-| `android/` | The Gradle project: a thin Kotlin `MainActivity` (system bars, Back) and the cargo-ndk build. |
+| `src/android/bridge.rs`, `src/android/keychars.rs` | Calls into Kotlin's `Bridge` and Android's key character maps (safe JNI only). |
+| `src/android/entry.rs` | The exported symbols (`android_main` and the native methods). |
+| `android/` | The Gradle project: Kotlin `MainActivity` (pickers, documents sent to the app, printing, keyboard, Back) and `Bridge` (storage, clipboard, links, sharing), and the cargo-ndk build. |
+| `licenses/crates.txt` | The Rust crates in the build and their licences, shown in About (`ci/licenses.py`; CI checks it's current). |
 | `ci/smoke.sh` | The emulator smoke test run by `.github/workflows/android.yml`. |
 
 Why not eframe: winit's Android backend drops mouse buttons, hover, the wheel, keyboard modifiers and IME
 text, which a word processor on a tablet with a keyboard needs. Owning the loop keeps every core crate
 unchanged.
+
+**Threads.** Every call into Kotlin is made from the `android_main` thread and returns at once (UI work is
+posted to the UI thread, storage work runs on one I/O thread); Kotlin's reports go into a queue and wake
+the loop. Neither side waits for the other, except `onStop`, which waits up to 1.5 s for the recovery
+snapshot.
 
 **One exception to "no `unsafe`".** The workspace forbids unsafe code. Android finds `android_main` and JNI
 methods by name, and exporting an unmangled symbol is `#[unsafe(no_mangle)]` in Rust 2024. So this crate
