@@ -1,0 +1,15 @@
+# Gradle and Android Studio
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+.cxx/
+captures/
+# Rust libraries copied in by hand (the Gradle build writes them under build/)
+**/jniLibs/
+# Signing keys never belong in the repository
+*.jks
+*.keystore

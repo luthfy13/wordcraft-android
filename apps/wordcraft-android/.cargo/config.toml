@@ -1,0 +1,14 @@
+# Cargo profiles for the APK. Cargo reads this file when it runs from `apps/wordcraft-android` (as the
+# Gradle build does), so the workspace's own profiles stay as upstream has them.
+
+# Debug APK: optimised like a release (typing must be fast on a tablet), with debug assertions and overflow
+# checks. No debug info (it would add ~190 MB per ABI): the symbol table stays, so a panic's backtrace in
+# logcat names the functions, and the panic message has the file and line.
+[profile.android-debug]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
+# Release APK. Phase 3 measures LTO and codegen units; Phase 4 strips symbols into a separate file.
+[profile.android-release]
+inherits = "release"
