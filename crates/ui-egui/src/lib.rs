@@ -1052,6 +1052,10 @@ impl WordApp {
                 ));
             }
             "ui.discord" => {
+                // Hidden with the community button (Options), say in a modified build: no link.
+                if !self.ui.show_discord {
+                    return Some(Ok(json!({"hidden": true})));
+                }
                 self.canvas.open_url = Some("https://discord.gg/artcraft".into());
                 json!({})
             }
