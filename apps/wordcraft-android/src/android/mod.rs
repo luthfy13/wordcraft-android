@@ -47,8 +47,12 @@ pub(crate) fn main(app: AndroidApp) {
     // The wheel's axes are off by default.
     app.enable_motion_axis(Axis::Vscroll);
     app.enable_motion_axis(Axis::Hscroll);
+    platform::saved::set_running(true);
     let mut state = State::new(app, &args);
-    state.run();
+    // A panic outside a frame (input, a report from Android, upkeep): the document is still saved below.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| state.run())).is_err() {
+        log::error!("the event loop panicked: keeping the document for the next start");
+    }
     inbox::set_waker(None);
     if state.host.quit_requested() {
         state.host.quit(FILES_WAIT);
@@ -58,6 +62,7 @@ pub(crate) fn main(app: AndroidApp) {
             log::warn!("the recovery snapshot wasn't written in time");
         }
     }
+    platform::saved::set_running(false);
     log::info!("Folio Writer stopping");
 }
 

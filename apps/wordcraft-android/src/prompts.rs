@@ -28,6 +28,11 @@ pub struct Prompts {
 }
 
 impl Prompts {
+    /// Whether the share offer shows.
+    pub fn is_open(&self) -> bool {
+        self.share.is_some()
+    }
+
     pub fn exported(&mut self, file: Exported, now: f64) {
         self.share = Some((file, now));
     }

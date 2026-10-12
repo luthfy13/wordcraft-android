@@ -214,7 +214,8 @@ object Bridge {
         val docFlags = meta.flags
         val supportsWrite = docFlags?.let { it and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0 }
         val granted = flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0 && (kept == 0 || kept and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0)
-        val writable = create || (granted && supportsWrite != false)
+        // Only documents from a document provider are written back, never a file path.
+        val writable = uri.scheme == ContentResolver.SCHEME_CONTENT && (create || (granted && supportsWrite != false))
         val persisted = kept != 0
         return JSONObject()
             .put("uri", uri.toString())
@@ -229,16 +230,16 @@ object Bridge {
     private class Meta(val name: String?, val mime: String?, val size: Long?, val modified: Long?, val flags: Int?) {
         fun remote(): JSONObject = JSONObject().put("modified", modified ?: JSONObject.NULL).put("size", size ?: JSONObject.NULL)
 
-        /** Whether the document seems changed since [was]: both known values differ, or the only known one does. */
+        /**
+         * Whether the document seems changed since [was]: its last change or its size differs, where both are
+         * known. (After each write-back the document is asked again, so the app's own writes don't count.)
+         */
         fun changedSince(was: JSONObject?): Boolean {
             val m0 = was?.optLongOrNull("modified")
             val s0 = was?.optLongOrNull("size")
-            val m = if (m0 != null && modified != null) m0 != modified else null
-            val s = if (s0 != null && size != null) s0 != size else null
-            return when {
-                m != null && s != null -> m && s
-                else -> m ?: s ?: false
-            }
+            val m = m0 != null && modified != null && m0 != modified
+            val s = s0 != null && size != null && s0 != size
+            return m || s
         }
     }
 
@@ -354,6 +355,11 @@ object Bridge {
      * be, so no old bytes are left after the end.
      */
     private fun write(resolver: ContentResolver, uri: Uri, path: File) {
+        // The copy is opened first: the document is truncated only once there's something to write.
+        FileInputStream(path).use { input -> writeFrom(resolver, uri, input) }
+    }
+
+    private fun writeFrom(resolver: ContentResolver, uri: Uri, input: InputStream) {
         var pfd: android.os.ParcelFileDescriptor? = null
         var last: Exception? = null
         for (mode in arrayOf("wt", "rwt", "w")) {
@@ -368,7 +374,7 @@ object Bridge {
         }
         val fd = pfd ?: throw (last as? RuntimeException ?: FileNotFoundException())
         android.os.ParcelFileDescriptor.AutoCloseOutputStream(fd).use { out ->
-            FileInputStream(path).use { it.copyTo(out, 64 * 1024) }
+            input.copyTo(out, 64 * 1024)
             out.flush()
             try {
                 out.channel.truncate(out.channel.position())
@@ -384,12 +390,12 @@ object Bridge {
     }
 
     private fun refresh(a: JSONObject): String? {
-        val entry = a.getLong("entry")
+        val req = a.getLong("req")
         val uri = Uri.parse(a.getString("uri"))
         val path = File(a.getString("path"))
         val expect = a.optJSONObject("expect")
         io.execute {
-            val event = JSONObject().put("event", "refreshed").put("entry", entry)
+            val event = JSONObject().put("event", "refreshed").put("req", req)
             try {
                 val resolver = resolver() ?: throw IllegalStateException()
                 val now = query(resolver, uri)
@@ -438,10 +444,17 @@ object Bridge {
         return JSONObject().put("text", text).toString()
     }
 
+    /** `{"ok": false}` when the clipboard didn't take it (too large for Android's limit, about 1 MB). */
     private fun clipboardSet(a: JSONObject): String? {
         val manager = context?.getSystemService(ClipboardManager::class.java) ?: return null
-        manager.setPrimaryClip(ClipData.newPlainText(LABEL, a.optString("text")))
-        return null
+        val ok = try {
+            manager.setPrimaryClip(ClipData.newPlainText(LABEL, a.optString("text")))
+            true
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "clipboard: ${e.javaClass.name}")
+            false
+        }
+        return JSONObject().put("ok", ok).toString()
     }
 
     private fun openUrl(url: String): Boolean {
@@ -464,6 +477,15 @@ object Bridge {
             val send = Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             send.clipData = ClipData.newRawUri(null, uri)
             activity.startActivity(Intent.createChooser(send, null))
+        }
+    }
+
+    /** Waits up to [ms] for the copies and write-backs already asked for. */
+    fun awaitIo(ms: Int) {
+        try {
+            io.submit {}.get(ms.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopping before the documents were written back")
         }
     }
 

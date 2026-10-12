@@ -50,8 +50,8 @@ pub fn file_op(op: &FileOp) -> (&'static str, Value) {
         FileOp::WriteBack { entry, uri, path: p, expect, force } => {
             ("writeBack", json!({"entry": entry, "uri": uri, "path": path(p), "expect": remote_json(*expect), "force": force}))
         }
-        FileOp::Refresh { entry, uri, path: p, expect } => {
-            ("refresh", json!({"entry": entry, "uri": uri, "path": path(p), "expect": remote_json(*expect)}))
+        FileOp::Refresh { req, uri, path: p, expect } => {
+            ("refresh", json!({"req": req, "uri": uri, "path": path(p), "expect": remote_json(*expect)}))
         }
         FileOp::ListGrants => ("grants", json!({})),
         FileOp::Release { uri } => ("release", json!({"uri": uri})),
@@ -152,7 +152,7 @@ pub fn parse(json: &str) -> Option<Inbound> {
             },
         },
         "refreshed" => FileEvent::Refreshed {
-            entry: entry()?,
+            req: req()?,
             result: match error(&v) {
                 Some(e) => Err(e),
                 None if v.get("changed").and_then(Value::as_bool).unwrap_or(false) => Ok(Some(remote(v.get("remote")))),
@@ -182,12 +182,21 @@ pub mod saved {
     use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
-    /// Stops asked for, and the last one whose files are written.
-    static STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    /// Stops asked for, the last one whose files are written, and whether the loop runs (when it doesn't,
+    /// nobody writes: there's nothing to wait for).
+    static STATE: Mutex<(u64, u64, bool)> = Mutex::new((0, 0, false));
     static DONE: Condvar = Condvar::new();
 
-    fn lock() -> MutexGuard<'static, (u64, u64)> {
+    fn lock() -> MutexGuard<'static, (u64, u64, bool)> {
         STATE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The loop started (`true`) or ended.
+    pub fn set_running(running: bool) {
+        let mut s = lock();
+        s.2 = running;
+        s.1 = s.0;
+        DONE.notify_all();
     }
 
     /// The activity is stopping (UI thread, before the loop hears of it).
@@ -208,7 +217,7 @@ pub mod saved {
         let deadline = Instant::now().checked_add(timeout);
         let mut s = lock();
         let want = s.0;
-        while s.1 < want {
+        while s.2 && s.1 < want {
             let left = deadline.map_or(Duration::ZERO, |d| d.saturating_duration_since(Instant::now()));
             if left.is_zero() {
                 return false;
@@ -224,8 +233,15 @@ pub mod inbox {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-    /// Reports kept at most; the oldest go first (an IME's states, say, when the loop is stuck).
+    /// Keyboard states kept at most while the loop is busy: the oldest go first (each is the whole buffer, so
+    /// a later one supersedes it). Other reports (pickers, copies, write-backs) are never dropped below
+    /// `MAX_REPORTS`, far more than the app ever has under way.
     pub const MAX_PENDING: usize = 256;
+    pub const MAX_REPORTS: usize = 4096;
+
+    fn is_keyboard(report: &str) -> bool {
+        report.contains(r#""event":"ime""#)
+    }
 
     type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -255,8 +271,16 @@ pub mod inbox {
         let wake = {
             let mut inbox = lock();
             if inbox.queue.len() >= MAX_PENDING {
-                inbox.queue.pop_front();
-                inbox.dropped = inbox.dropped.saturating_add(1);
+                let oldest_keyboard = inbox.queue.iter().position(|r| is_keyboard(r));
+                let drop = match oldest_keyboard {
+                    Some(i) => Some(i),
+                    None if inbox.queue.len() >= MAX_REPORTS => Some(0),
+                    None => None,
+                };
+                if let Some(i) = drop {
+                    inbox.queue.remove(i);
+                    inbox.dropped = inbox.dropped.saturating_add(1);
+                }
             }
             inbox.queue.push_back(report);
             inbox.waker.clone()
@@ -301,7 +325,7 @@ mod tests {
             parse(r#"{"event":"wroteBack","entry":2,"error":"java.lang.SecurityException","lost":true}"#),
             Some(Inbound::File(FileEvent::WroteBack { entry: 2, result: Err(WriteError::Lost("java.lang.SecurityException".into())) }))
         );
-        assert_eq!(parse(r#"{"event":"refreshed","entry":2}"#), Some(Inbound::File(FileEvent::Refreshed { entry: 2, result: Ok(None) })));
+        assert_eq!(parse(r#"{"event":"refreshed","req":2}"#), Some(Inbound::File(FileEvent::Refreshed { req: 2, result: Ok(None) })));
         let Some(Inbound::Incoming(docs)) = parse(r#"{"event":"incoming","documents":[{"uri":"content://a"},{"name":"no uri"}]}"#) else { panic!() };
         assert_eq!(docs.len(), 1);
         let ime = parse(r#"{"event":"ime","text":"a😀b","selStart":3,"selEnd":3,"compStart":-1,"compEnd":-1,"generation":4}"#);
@@ -340,6 +364,10 @@ mod tests {
     #[test]
     fn stopping_waits_for_the_files() {
         use std::time::Duration;
+        saved::set_running(false);
+        saved::stopping();
+        assert!(saved::wait(Duration::from_secs(10)), "no loop: nothing to wait for");
+        saved::set_running(true);
         saved::stopping();
         assert!(!saved::wait(Duration::from_millis(20)), "not written yet");
         let writer = std::thread::spawn(|| {
@@ -359,13 +387,15 @@ mod tests {
             w.fetch_add(1, Ordering::Relaxed);
         })));
         let _ = inbox::take();
+        inbox::deliver(r#"{"event":"wroteBack","entry":1}"#.into());
         for i in 0..inbox::MAX_PENDING + 2 {
-            inbox::deliver(i.to_string());
+            inbox::deliver(format!(r#"{{"event":"ime","generation":{i}}}"#));
         }
         let (queue, dropped) = inbox::take();
         assert_eq!(queue.len(), inbox::MAX_PENDING);
-        assert_eq!(queue.front().map(String::as_str), Some("2"));
-        assert_eq!(dropped, 2);
+        assert!(queue.front().is_some_and(|r| r.contains("wroteBack")), "a file report is never dropped for keyboard states");
+        assert!(queue.get(1).is_some_and(|r| r.contains(r#""generation":3}"#)), "the oldest keyboard states go");
+        assert_eq!(dropped, 3);
         assert!(woken.load(Ordering::Relaxed) >= inbox::MAX_PENDING);
         inbox::set_waker(None);
         inbox::deliver("x".into());

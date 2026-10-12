@@ -33,8 +33,10 @@ use wordcraft_ui_egui::file_dialogs::{FileDialogAnswer, FileDialogRequest, open_
 use crate::prompts::Exported;
 use crate::store::write_atomic;
 
-/// Documents remembered at most (Recent lists 50).
+/// Documents remembered at most (Recent lists 50); more only while they hold changes not written back.
 const MAX_ENTRIES: usize = 64;
+/// Entries read from `docs.json` at most (a damaged or hostile file).
+const MAX_LOADED: usize = 1024;
 /// Longest mirror file name kept, in characters.
 const MAX_NAME: usize = 120;
 /// Largest `docs.json` read.
@@ -118,7 +120,7 @@ pub enum FileOp {
     /// is what `expect` says.
     WriteBack { entry: u64, uri: String, path: PathBuf, expect: Remote, force: bool },
     /// Check the document at `uri` against `expect`; if it changed, copy it to `path`.
-    Refresh { entry: u64, uri: String, path: PathBuf, expect: Remote },
+    Refresh { req: u64, uri: String, path: PathBuf, expect: Remote },
     /// Report which permissions are still held ([`FileEvent::Grants`]).
     ListGrants,
     /// Give up the permission for `uri`.
@@ -141,9 +143,9 @@ pub enum FileEvent {
         entry: u64,
         result: Result<Remote, WriteError>,
     },
-    /// `Some`: the document had changed and was copied in again.
+    /// `Some`: the document had changed and was copied.
     Refreshed {
-        entry: u64,
+        req: u64,
         result: Result<Option<Remote>, String>,
     },
     /// Android sent a document (Open with, Share). `req` names the copy-in to follow.
@@ -239,8 +241,32 @@ struct Pending {
     req: u64,
     request: FileDialogRequest,
     tx: Sender<FileDialogAnswer>,
-    /// Being copied in: the entry (documents) and the path the answer gives.
-    copying: Option<(Option<u64>, PathBuf)>,
+    /// The picked document is being copied in (`Then::Answer`).
+    copying: bool,
+}
+
+/// What a finished copy leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    /// Answer the open file dialog with the document.
+    Answer,
+    /// Open it as a dropped file (Open with, Share).
+    Open,
+    /// Open it again if it's the open, untouched document (a newer version was found).
+    Reopen,
+}
+
+/// A copy from Android's storage under way.
+struct Copy {
+    req: u64,
+    /// The document's entry; `None` for a picture, font or the like, read once.
+    entry: Option<u64>,
+    /// Where the platform writes.
+    dest: PathBuf,
+    /// For a document already here: its mirror, and the mirror's stamp when the copy began. The copy goes
+    /// beside it and replaces it only if nothing changed the mirror meanwhile.
+    replaces: Option<(PathBuf, Option<Stamp>)>,
+    then: Then,
 }
 
 /// Shared with the app's `file_dialog` hook.
@@ -284,8 +310,7 @@ pub struct Files {
     next: u64,
     dialogs: Rc<RefCell<Dialogs>>,
     ops: Vec<FileOp>,
-    /// Copy-ins of documents Android sent: the request, the entry or import, and the path to open.
-    incoming: Vec<(u64, Option<u64>, PathBuf)>,
+    copies: Vec<Copy>,
     /// Files to open as dropped files, next frame.
     to_open: Vec<PathBuf>,
     questions: Vec<Question>,
@@ -310,7 +335,7 @@ impl Files {
             next: 1,
             dialogs: Rc::default(),
             ops: Vec::new(),
-            incoming: Vec::new(),
+            copies: Vec::new(),
             to_open: Vec::new(),
             questions: Vec::new(),
             notices: Vec::new(),
@@ -319,6 +344,7 @@ impl Files {
             changed: false,
         };
         files.load();
+        files.remove_leftovers();
         files.ops.push(FileOp::ListGrants);
         // Changes a previous run couldn't write back: try again.
         let pending: Vec<u64> = files.entries.iter().filter(|e| e.sync != Sync::Clean && e.writable).map(|e| e.id).collect();
@@ -350,12 +376,27 @@ impl Files {
         let mut seen = BTreeSet::new();
         for e in v.get("documents").and_then(Value::as_array).into_iter().flatten().filter_map(Entry::from_json) {
             let mirror = self.docs.join(&e.file);
-            if seen.insert(e.id) && self.entries.len() < MAX_ENTRIES && mirror.is_file() {
+            if seen.insert(e.id) && self.entries.len() < MAX_LOADED && mirror.is_file() {
                 self.next = self.next.max(e.id.saturating_add(1));
                 self.entries.push(Entry { stamp: Stamp::of(&mirror), ..e });
             }
         }
         self.next = self.next.max(v.get("next").and_then(Value::as_u64).unwrap_or(1));
+    }
+
+    /// Copies a killed process left beside the mirrors, and temporary files.
+    fn remove_leftovers(&self) {
+        let dirs = std::iter::once(self.docs.clone()).chain(self.entries.iter().filter_map(|e| self.mirror(e).parent().map(Path::to_path_buf)));
+        for dir in dirs {
+            let Ok(list) = fs::read_dir(&dir) else { continue };
+            for f in list.flatten() {
+                let name = f.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') && (name.ends_with(".incoming") || name.ends_with(".copy") || name.ends_with(".tmp")) {
+                    let _ = fs::remove_file(f.path());
+                }
+            }
+        }
     }
 
     /// Writes `docs.json` if it changed.
@@ -434,9 +475,9 @@ impl Files {
     pub fn event(&mut self, event: FileEvent, app: &mut WordApp) {
         match event {
             FileEvent::Picked { req, result } => self.picked(req, result),
-            FileEvent::CopiedIn { req, result } => self.copied_in(req, result),
+            FileEvent::CopiedIn { req, result } => self.copied_in(req, result, app),
             FileEvent::WroteBack { entry, result } => self.wrote_back(entry, result, app),
-            FileEvent::Refreshed { entry, result } => self.refreshed(entry, result, app),
+            FileEvent::Refreshed { req, result } => self.finish_copy(req, result, app),
             FileEvent::Incoming { picked } => self.incoming(picked),
             FileEvent::Grants { uris } => self.grants(&uris, app),
         }
@@ -444,7 +485,7 @@ impl Files {
 
     fn picked(&mut self, req: u64, result: Result<Option<Picked>, String>) {
         let mut dialogs = self.dialogs.borrow_mut();
-        let Some(p) = dialogs.pending.take_if(|p| p.req == req && p.copying.is_none()) else {
+        let Some(p) = dialogs.pending.take_if(|p| p.req == req && !p.copying) else {
             log::warn!("a picker answered a request that's gone");
             return;
         };
@@ -484,62 +525,136 @@ impl Files {
             }
             FileDialogRequest::Open { purpose } => {
                 let name = open_name(&picked.name, picked.mime.as_deref());
-                let (entry, path) = if purpose == "document" {
+                let copy = if purpose == "document" {
                     let id = self.entry_for(&picked, &name);
-                    let Some(e) = self.entry(id) else { return answer(p.tx, Ok(None)) };
-                    let mirror = self.mirror(e);
-                    // Changes not written back yet are newer than the document: open them.
-                    if e.sync != Sync::Clean && mirror.is_file() {
-                        self.notices.push(format!("{} has changes that aren't saved to its file yet: opening them", e.display_name()));
+                    // Changes not written back yet are newer than the document: they open as they are.
+                    if let Some(mirror) = self.unsynced_mirror(id) {
                         return answer(p.tx, Ok(Some(mirror.to_string_lossy().into_owned())));
                     }
-                    (Some(id), mirror)
+                    self.document_copy(req, id, Then::Answer)
                 } else {
-                    let req = self.id();
-                    (None, self.imports.join(req.to_string()).join(&name))
+                    let n = self.id();
+                    let dest = self.imports.join(n.to_string()).join(&name);
+                    Some(Copy { req, entry: None, dest, replaces: None, then: Then::Answer })
                 };
-                if let Some(dir) = path.parent()
+                let Some(copy) = copy else { return answer(p.tx, Ok(None)) };
+                if let Some(dir) = copy.dest.parent()
                     && let Err(err) = fs::create_dir_all(dir)
                 {
                     self.notices.push(format!("Can't open {name}: {err}"));
                     return answer(p.tx, Ok(None));
                 }
-                self.ops.push(FileOp::CopyIn { req, uri: picked.uri.clone(), path: path.clone() });
-                self.dialogs.borrow_mut().pending = Some(Pending { copying: Some((entry, path)), ..p });
+                self.ops.push(FileOp::CopyIn { req, uri: picked.uri.clone(), path: copy.dest.clone() });
+                self.copies.push(copy);
+                self.dialogs.borrow_mut().pending = Some(Pending { copying: true, ..p });
             }
         }
     }
 
-    fn copied_in(&mut self, req: u64, result: Result<Remote, String>) {
-        if let Some(i) = self.incoming.iter().position(|(r, ..)| *r == req) {
-            let (_, entry, path) = self.incoming.remove(i);
-            match result {
-                Ok(remote) => {
-                    log::info!("opening a document sent to the app");
-                    if let Some(id) = entry {
-                        self.synced_in(id, remote, &path);
-                    }
-                    self.to_open.push(path);
-                }
-                Err(e) => self.notices.push(format!("Can't open the document: {e}")),
-            }
-            return;
+    /// The mirror of entry `id` if it holds changes not written back (or being written), which are newer
+    /// than the document: it's opened as it is, with a word.
+    fn unsynced_mirror(&mut self, id: u64) -> Option<PathBuf> {
+        let e = self.entry(id)?;
+        let mirror = self.mirror(e);
+        if (e.sync == Sync::Clean && !e.in_flight) || !mirror.is_file() {
+            return None;
         }
-        let mut dialogs = self.dialogs.borrow_mut();
-        let Some(p) = dialogs.pending.take_if(|p| p.req == req && p.copying.is_some()) else { return };
-        drop(dialogs);
-        let Some((entry, path)) = p.copying else { return };
-        match result {
-            Ok(remote) => {
-                if let Some(id) = entry {
-                    self.synced_in(id, remote, &path);
+        self.notices.push(format!("{} has changes that aren't saved to its file yet: opening them", e.display_name()));
+        Some(mirror)
+    }
+
+    /// A copy of entry `id`'s document: into its mirror if there's none yet, else beside it.
+    fn document_copy(&self, req: u64, id: u64, then: Then) -> Option<Copy> {
+        let e = self.entry(id)?;
+        let mirror = self.mirror(e);
+        if !mirror.is_file() {
+            return Some(Copy { req, entry: Some(id), dest: mirror, replaces: None, then });
+        }
+        let name = mirror.file_name()?.to_string_lossy().into_owned();
+        let dest = mirror.with_file_name(format!(".{name}.incoming"));
+        let stamp = Stamp::of(&mirror);
+        Some(Copy { req, entry: Some(id), dest, replaces: Some((mirror, stamp)), then })
+    }
+
+    fn copied_in(&mut self, req: u64, result: Result<Remote, String>, app: &mut WordApp) {
+        self.finish_copy(req, result.map(Some), app);
+    }
+
+    /// A copy finished (`Ok(None)`: a refresh found nothing new). A copy beside a mirror replaces it only if
+    /// the mirror is as it was, holds no changes still to write back, and isn't open with unsaved changes:
+    /// otherwise the changes here stay, and the next write-back finds the conflict.
+    fn finish_copy(&mut self, req: u64, result: Result<Option<Remote>, String>, app: &mut WordApp) {
+        let Some(i) = self.copies.iter().position(|c| c.req == req) else { return };
+        let copy = self.copies.remove(i);
+        let path = copy.replaces.as_ref().map_or_else(|| copy.dest.clone(), |(mirror, _)| mirror.clone());
+        let fresh = match result {
+            Ok(Some(remote)) => match (copy.entry, &copy.replaces) {
+                (Some(id), Some((mirror, stamp))) => {
+                    let edited = app.session.path.as_deref() == Some(mirror.as_path()) && app.session.dirty;
+                    let untouched = self.entry(id).is_some_and(|e| e.sync == Sync::Clean && !e.in_flight) && Stamp::of(mirror) == *stamp;
+                    if untouched && !edited && fs::rename(&copy.dest, mirror).is_ok() {
+                        self.synced_in(id, remote, mirror);
+                        true
+                    } else {
+                        let _ = fs::remove_file(&copy.dest);
+                        log::info!("a newer version of {} wasn't copied over the changes made here", mirror.display());
+                        false
+                    }
                 }
-                answer(p.tx, Ok(Some(path.to_string_lossy().into_owned())));
+                (Some(id), None) => {
+                    self.synced_in(id, remote, &copy.dest);
+                    true
+                }
+                (None, _) => true,
+            },
+            Ok(None) => {
+                if copy.replaces.is_some() {
+                    let _ = fs::remove_file(&copy.dest);
+                }
+                false
             }
             Err(e) => {
-                self.notices.push(format!("Can't open the document: {e}"));
-                answer(p.tx, Ok(None));
+                if copy.replaces.is_some() {
+                    let _ = fs::remove_file(&copy.dest);
+                }
+                // A document read before opens as it was kept here (offline, say).
+                let kept = copy.replaces.is_some() && copy.then != Then::Reopen;
+                if copy.then == Then::Reopen {
+                    log::info!("can't check {} for changes: {e}", path.display());
+                } else if kept {
+                    self.notices.push(format!("Can't read the document now ({e}): opening the copy kept on this device"));
+                } else {
+                    self.notices.push(format!("Can't open the document: {e}"));
+                }
+                if !kept {
+                    if copy.then == Then::Answer {
+                        self.answer_copy(Ok(None));
+                    }
+                    return;
+                }
+                false
             }
+        };
+        match copy.then {
+            Then::Answer => self.answer_copy(Ok(Some(path.to_string_lossy().into_owned()))),
+            Then::Open => {
+                log::info!("opening a document sent to the app");
+                self.to_open.push(path);
+            }
+            Then::Reopen => {
+                if fresh && app.session.path.as_deref() == Some(path.as_path()) && !app.session.dirty {
+                    log::info!("{} changed elsewhere: opening the new version", path.display());
+                    let _ = app.run("file.open", json!({"path": path.to_string_lossy()}));
+                }
+            }
+        }
+    }
+
+    /// Answers the dialog waiting on a copy.
+    fn answer_copy(&mut self, result: FileDialogAnswer) {
+        let pending = self.dialogs.borrow_mut().pending.take_if(|p| p.copying);
+        if let Some(p) = pending {
+            answer(p.tx, result);
         }
     }
 
@@ -559,20 +674,23 @@ impl Files {
         }
         let name = open_name(&picked.name, picked.mime.as_deref());
         let req = self.id();
-        let (entry, path) = if is_document_name(&name) {
+        let copy = if is_document_name(&name) {
             let id = self.entry_for(&picked, &name);
-            match self.entry(id) {
-                Some(e) => (Some(id), self.mirror(e)),
-                None => return,
+            if let Some(mirror) = self.unsynced_mirror(id) {
+                self.to_open.push(mirror);
+                return;
             }
+            self.document_copy(req, id, Then::Open)
         } else {
-            (None, self.imports.join(req.to_string()).join(&name))
+            let dest = self.imports.join(req.to_string()).join(&name);
+            Some(Copy { req, entry: None, dest, replaces: None, then: Then::Open })
         };
-        if let Some(dir) = path.parent() {
+        let Some(copy) = copy else { return };
+        if let Some(dir) = copy.dest.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        self.ops.push(FileOp::CopyIn { req, uri: picked.uri, path: path.clone() });
-        self.incoming.push((req, entry, path));
+        self.ops.push(FileOp::CopyIn { req, uri: picked.uri, path: copy.dest.clone() });
+        self.copies.push(copy);
     }
 
     fn grants(&mut self, uris: &[String], app: &mut WordApp) {
@@ -598,13 +716,8 @@ impl Files {
             !p.starts_with(&docs) || (known.contains(p) && p.is_file())
         });
         let keep: BTreeSet<PathBuf> = app.ui.recent.iter().map(PathBuf::from).chain(app.session.path.clone()).collect();
-        // Documents being copied in, for a dialog or sent to the app.
-        let copying: BTreeSet<u64> = self
-            .incoming
-            .iter()
-            .filter_map(|(_, entry, _)| *entry)
-            .chain(self.dialogs.borrow().pending.as_ref().and_then(|p| p.copying.as_ref()).and_then(|(entry, _)| *entry))
-            .collect();
+        // Documents being copied in.
+        let copying: BTreeSet<u64> = self.copies.iter().filter_map(|c| c.entry).collect();
         let mut gone = Vec::new();
         self.entries.retain(|e| {
             let mirror = docs.join(&e.file);
@@ -614,9 +727,13 @@ impl Files {
             }
             kept
         });
-        // Over the cap: the oldest clean ones go even if listed.
+        // Over the cap: the oldest clean ones go, even if listed, but not the open one or one in use.
+        let open = app.session.path.clone();
         while self.entries.len() > MAX_ENTRIES {
-            match self.entries.iter().rposition(|e| e.sync == Sync::Clean && !e.in_flight && keep.iter().all(|k| *k != docs.join(&e.file))) {
+            let spare = |e: &Entry| {
+                e.sync == Sync::Clean && !e.in_flight && !e.watch && !copying.contains(&e.id) && open.as_deref() != Some(docs.join(&e.file).as_path())
+            };
+            match self.entries.iter().rposition(spare) {
                 Some(i) => gone.push(self.entries.remove(i)),
                 None => break,
             }
@@ -713,23 +830,6 @@ impl Files {
         }
     }
 
-    fn refreshed(&mut self, id: u64, result: Result<Option<Remote>, String>, app: &mut WordApp) {
-        let Some(e) = self.entry(id) else { return };
-        let mirror = self.mirror(e);
-        match result {
-            Ok(Some(remote)) => {
-                self.synced_in(id, remote, &mirror);
-                // Reopen it if it's open and untouched; otherwise the next open shows the new text.
-                if app.session.path.as_deref() == Some(mirror.as_path()) && !app.session.dirty {
-                    log::info!("{} changed elsewhere: opening the new version", mirror.display());
-                    let _ = app.run("file.open", json!({"path": mirror.to_string_lossy()}));
-                }
-            }
-            Ok(None) => {}
-            Err(e) => log::info!("can't check {} for changes: {e}", mirror.display()),
-        }
-    }
-
     /// After each frame: shows pickers the app asked for, notices saves to write back, checks a document
     /// just opened from Recent for newer versions.
     pub fn after_frame(&mut self, app: &mut WordApp) {
@@ -743,8 +843,14 @@ impl Files {
                 && let Some(e) = self.entry_at(path)
                 && e.sync == Sync::Clean
                 && !e.in_flight
+                && !self.copies.iter().any(|c| c.entry == Some(e.id))
             {
-                self.ops.push(FileOp::Refresh { entry: e.id, uri: e.uri.clone(), path: path.clone(), expect: e.remote });
+                let (id, uri, expect) = (e.id, e.uri.clone(), e.remote);
+                let req = self.id();
+                if let Some(copy) = self.document_copy(req, id, Then::Reopen) {
+                    self.ops.push(FileOp::Refresh { req, uri, path: copy.dest.clone(), expect });
+                    self.copies.push(copy);
+                }
             }
         }
         // Saves: the open document's mirror, and files Save dialogs handed out.
@@ -805,7 +911,7 @@ impl Files {
                 }
             };
             self.ops.push(op);
-            self.dialogs.borrow_mut().pending = Some(Pending { req, request, tx, copying: None });
+            self.dialogs.borrow_mut().pending = Some(Pending { req, request, tx, copying: false });
         }
     }
 
@@ -839,7 +945,8 @@ impl Files {
         self.entries.iter().any(|e| e.in_flight)
     }
 
-    /// Whether a write-back is under way or failed: leaving now could lose the changes.
+    /// Whether a write-back is under way or failed.
+    #[cfg(test)]
     pub fn unsynced(&self) -> bool {
         self.entries.iter().any(|e| e.in_flight || e.sync == Sync::Failed)
     }
@@ -1016,10 +1123,11 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// What Android's copy writes: a .docx with `text`, wherever the copy goes.
     fn write_doc(path: &Path, text: &str) {
         let mut s = Session::new(wordcraft_doc::Document::new());
         s.run("text.insert", &json!({"text": text})).unwrap();
-        wordcraft_engine::io::save_path_with(path, &s.doc, None, &Default::default()).unwrap();
+        fs::write(path, wordcraft_engine::io::save_bytes("copy.docx", &s.doc).unwrap()).unwrap();
     }
 
     #[test]
@@ -1243,6 +1351,85 @@ mod tests {
         // Document 0's permission is gone: saving it asks for a new place.
         assert!(!files.entry_at(&paths[0]).unwrap().writable);
         assert!(files.entry_at(&paths[1]).unwrap().writable);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A document opened from Android and saved here, its write-back done.
+    fn opened_and_synced(files: &mut Files, app: &mut WordApp, n: u32, text: &str) -> (u64, PathBuf) {
+        files.after_frame(app);
+        files.event(FileEvent::Incoming { picked: picked(n, &format!("d{n}.docx")) }, app);
+        let ops = files.take_ops();
+        let [FileOp::CopyIn { req, path, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        write_doc(path, text);
+        files.event(FileEvent::CopiedIn { req: *req, result: Ok(Remote { modified: Some(1), size: Some(1) }) }, app);
+        let path = files.take_to_open().pop().unwrap();
+        app.run("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        files.after_frame(app);
+        // Opening asks whether there's a newer version: there isn't.
+        let ops = files.take_ops();
+        let [FileOp::Refresh { req, path: side, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_ne!(side, &path, "a refresh copies beside the mirror");
+        files.event(FileEvent::Refreshed { req: *req, result: Ok(None) }, app);
+        let id = files.entry_at(&path).unwrap().id;
+        (id, path)
+    }
+
+    #[test]
+    fn open_with_never_copies_over_changes_still_to_write_back() {
+        let root = temp_dir("files-unsynced");
+        let mut files = Files::new(&root);
+        files.take_ops();
+        let mut app = app(&files);
+        let (id, path) = opened_and_synced(&mut files, &mut app, 1, "first");
+        app.run("text.insert", json!({"text": "mine "})).unwrap();
+        app.run("file.save", json!({})).unwrap();
+        files.after_frame(&mut app);
+        files.take_ops();
+        files.event(FileEvent::WroteBack { entry: id, result: Err(WriteError::Failed("offline".into())) }, &mut app);
+        let saved = fs::read(&path).unwrap();
+        // The same document, sent again from the Files app.
+        files.event(FileEvent::Incoming { picked: picked(1, "d1.docx") }, &mut app);
+        assert!(files.take_ops().iter().all(|o| !matches!(o, FileOp::CopyIn { .. })), "nothing is copied over the changes");
+        assert_eq!(files.take_to_open(), std::slice::from_ref(&path));
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_newer_version_found_while_editing_waits_for_the_conflict() {
+        let root = temp_dir("files-refresh");
+        let mut files = Files::new(&root);
+        files.take_ops();
+        let mut app = app(&files);
+        let (id, path) = opened_and_synced(&mut files, &mut app, 2, "first");
+        // Opened again from Recent while the other device's version downloads; the user types meanwhile.
+        app.run("file.new", json!({})).unwrap();
+        files.after_frame(&mut app);
+        app.run("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        files.after_frame(&mut app);
+        let ops = files.take_ops();
+        let [FileOp::Refresh { req, path: side, expect, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!(expect.modified, Some(1));
+        app.run("text.insert", json!({"text": "typed meanwhile "})).unwrap();
+        write_doc(side, "theirs");
+        files.event(FileEvent::Refreshed { req: *req, result: Ok(Some(Remote { modified: Some(2), size: Some(2) })) }, &mut app);
+        assert!(!side.exists());
+        assert!(app.session.doc.plain_text(StoryRef::Body).contains("typed meanwhile"), "the edits stay");
+        assert_eq!(files.entry(id).unwrap().remote.modified, Some(1), "so the next write-back finds the conflict");
+        // Untouched, the newer version is opened.
+        app.session.dirty = false;
+        app.run("file.new", json!({})).unwrap();
+        files.after_frame(&mut app);
+        app.run("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        files.after_frame(&mut app);
+        let ops = files.take_ops();
+        let [FileOp::Refresh { req, path: side, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        write_doc(side, "theirs");
+        files.event(FileEvent::Refreshed { req: *req, result: Ok(Some(Remote { modified: Some(2), size: Some(2) })) }, &mut app);
+        assert!(app.session.doc.plain_text(StoryRef::Body).contains("theirs"));
+        assert_eq!(files.entry(id).unwrap().remote.modified, Some(2));
+        files.after_frame(&mut app);
+        assert!(files.take_ops().iter().all(|o| !matches!(o, FileOp::WriteBack { .. })), "a copy-in isn't a save");
         let _ = fs::remove_dir_all(root);
     }
 

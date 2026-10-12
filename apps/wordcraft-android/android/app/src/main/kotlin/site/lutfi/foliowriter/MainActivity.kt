@@ -1,6 +1,7 @@
 package site.lutfi.foliowriter
 
 import android.app.Activity
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -87,8 +88,10 @@ class MainActivity : GameActivity() {
     override fun onStop() {
         Bridge.stopping()
         super.onStop()
-        // The app may be killed from here on: the snapshot of unsaved changes is written first.
+        // The app may be killed from here on: the snapshot of unsaved changes, and documents being written
+        // back, are given time to finish first.
         Bridge.awaitSaved(1500)
+        Bridge.awaitIo(1500)
     }
 
     override fun onDestroy() {
@@ -105,8 +108,23 @@ class MainActivity : GameActivity() {
             Intent.ACTION_SEND_MULTIPLE -> IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
             else -> emptyList()
         }
-        Bridge.incoming(uris, intent.flags)
+        Bridge.incoming(uris.filter(::acceptable), intent.flags)
     }
+
+    /**
+     * Documents another app may hand over: from a document provider (not this app's own), or the text this
+     * activity saved for a share. Never another path in this app's storage.
+     */
+    private fun acceptable(uri: Uri): Boolean = when (uri.scheme) {
+        ContentResolver.SCHEME_CONTENT -> uri.authority != "$packageName.files"
+        ContentResolver.SCHEME_FILE -> try {
+            val shared = File(cacheDir, "shared").canonicalFile
+            uri.path?.let { File(it).canonicalFile.startsWith(shared) } == true
+        } catch (e: java.io.IOException) {
+            false
+        }
+        else -> false
+    }.also { if (!it) Log.w(TAG, "not opening a document from ${uri.scheme}") }
 
     /** Text shared without a file: saved as one, which opens as a new document. */
     private fun sharedText(intent: Intent): Uri? {

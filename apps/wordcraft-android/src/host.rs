@@ -77,8 +77,8 @@ pub struct Host {
     input: Translator,
     events: Vec<Event>,
     /// Text copied in the app: the clipboard without a platform (tests), and what's pasted when the
-    /// system clipboard can't be read.
-    clipboard: Rc<RefCell<String>>,
+    /// system clipboard can't be read or didn't take the last copy (too large).
+    clipboard: Rc<RefCell<Clip>>,
     /// Android, or `None` (tests: the app's own file browser and clipboard).
     platform: Option<Rc<dyn Platform>>,
     files: Option<Files>,
@@ -117,9 +117,10 @@ pub struct Host {
 impl Host {
     /// The app, with the settings and any unsaved document a previous run left in `dirs`.
     pub fn new(launch: &Launch, dirs: Option<Dirs>, platform: Option<Rc<dyn Platform>>) -> Self {
-        let clipboard = Rc::new(RefCell::new(String::new()));
+        let clipboard = Rc::new(RefCell::new(Clip::default()));
         // Added fonts before the first layout, as on the desktop.
         if let Some(dirs) = &dirs {
+            store::remove_leftovers(dirs);
             store::load_fonts_and_dictionaries(dirs);
         }
         let files = dirs.as_ref().filter(|_| platform.is_some()).map(|d| Files::new(d.root()));
@@ -213,27 +214,24 @@ impl Host {
         self.ctx.request_repaint();
     }
 
-    /// Whether the app may close now that it asked to (File › Exit): not while a document is being
-    /// written back. If writing back failed, or takes too long, closing is cancelled and the user told.
+    /// Whether the app may close now that it asked to (File › Exit): not while a document is being written
+    /// back, for up to `QUIT_WAIT`.
     pub fn ready_to_quit(&mut self) -> bool {
         let Some(files) = &self.files else { return true };
-        if !files.unsynced() {
+        if !files.writing() {
             return true;
         }
+        // A write-back that doesn't finish is tried again at the next start (the copy here is kept).
         let since = *self.quitting.get_or_insert_with(Instant::now);
-        if files.writing() && since.elapsed() < QUIT_WAIT {
-            return false;
-        }
-        self.quitting = None;
-        self.app.quit_requested = false;
-        self.app.status("Not closed: a document couldn't be saved to its file. Save it again or use Save As.");
-        self.ctx.request_repaint();
-        false
+        since.elapsed() >= QUIT_WAIT
     }
 
     /// The user quit (File › Exit, or closing the document): the settings are written and nothing is kept
     /// to recover, the user having saved or discarded the changes. Waits up to `timeout` for the files.
     pub fn quit(&mut self, timeout: std::time::Duration) {
+        if let Some(files) = &mut self.files {
+            files.save();
+        }
         self.save_prefs();
         if let Some(r) = &mut self.recovery {
             r.discard();
@@ -395,7 +393,7 @@ impl Host {
 
     pub fn key(&mut self, k: &KeyPress) {
         if k.keycode == code::BACK && k.pressed && self.back.is_none() {
-            self.back = Some(BackState::of(&self.app, &self.ctx, self.about.is_open()));
+            self.back = Some(BackState::of(&self.app, &self.ctx, self.host_open()));
         }
         // A key ends the keyboard's composition first, where it is.
         if k.pressed && !keymap::is_modifier(k.keycode) {
@@ -451,10 +449,12 @@ impl Host {
         for command in out.platform_output.commands {
             match command {
                 OutputCommand::CopyText(text) => {
-                    if let Some(p) = &self.platform {
-                        p.call("clipboardSet", json!({"text": text}));
+                    let system = self.platform.as_ref().and_then(|p| p.call("clipboardSet", json!({"text": text})));
+                    let taken = system.is_some_and(|v| v.get("ok").and_then(serde_json::Value::as_bool) == Some(true));
+                    if !taken && self.platform.is_some() {
+                        log::warn!("the system clipboard didn't take the copy: pasting it within the app");
                     }
-                    *self.clipboard.borrow_mut() = text;
+                    *self.clipboard.borrow_mut() = Clip { text, own: !taken };
                 }
                 OutputCommand::OpenUrl(url) => {
                     if let Some(p) = &self.platform {
@@ -480,7 +480,7 @@ impl Host {
             }
         }
         if let Some(before) = self.back.take()
-            && before == BackState::of(&self.app, &self.ctx, self.about.is_open())
+            && before == BackState::of(&self.app, &self.ctx, self.host_open())
             && let Some(p) = &self.platform
         {
             // Back with nothing to close: the app goes to the background, as at any app's root.
@@ -489,6 +489,11 @@ impl Host {
         self.pump();
         let primitives = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point })
+    }
+
+    /// Whether something the host shows itself is open (Back closes it).
+    fn host_open(&self) -> bool {
+        self.about.is_open() || self.prompts.is_open() || self.files.as_ref().is_some_and(|f| f.question().is_some())
     }
 
     /// Where the keyboard's text goes after this frame, and what's there.
@@ -572,8 +577,8 @@ impl Host {
 /// What Back (sent as Esc) may close or end; when none of it changes, Back leaves the app.
 #[derive(PartialEq)]
 struct BackState {
-    /// The host's own About.
-    about: bool,
+    /// The host's own About, questions and offers.
+    host: bool,
     dialog: bool,
     file_dialog: bool,
     backstage: bool,
@@ -587,9 +592,9 @@ struct BackState {
 }
 
 impl BackState {
-    fn of(app: &WordApp, ctx: &egui::Context, about: bool) -> Self {
+    fn of(app: &WordApp, ctx: &egui::Context, host: bool) -> Self {
         Self {
-            about,
+            host,
             dialog: app.dialog.is_some(),
             file_dialog: app.file_dialog_open(),
             backstage: app.ui.backstage,
@@ -619,9 +624,21 @@ impl egui::DroppedFile for LocalFile {
 }
 
 /// The system clipboard's text, else what was copied in the app.
-fn clipboard_text(platform: Option<&Rc<dyn Platform>>, own: &Rc<RefCell<String>>) -> Option<String> {
+fn clipboard_text(platform: Option<&Rc<dyn Platform>>, own: &Rc<RefCell<Clip>>) -> Option<String> {
+    let clip = own.borrow();
+    if clip.own && !clip.text.is_empty() {
+        return Some(clip.text.clone());
+    }
     let system = platform.and_then(|p| p.call("clipboardGet", json!({}))).and_then(|v| v.get("text")?.as_str().map(str::to_owned));
-    system.or_else(|| Some(own.borrow().clone())).filter(|t| !t.is_empty())
+    system.or_else(|| Some(clip.text.clone())).filter(|t| !t.is_empty())
+}
+
+/// The app's own copy of the clipboard.
+#[derive(Default)]
+struct Clip {
+    text: String,
+    /// The system clipboard didn't take it: it's newer than what the system holds.
+    own: bool,
 }
 
 /// egui as eframe sets it up on a phone or tablet: one window, so viewports are embedded, and up to two
@@ -633,7 +650,7 @@ fn new_context() -> egui::Context {
     ctx
 }
 
-fn services(clipboard: &Rc<RefCell<String>>, platform: Option<&Rc<dyn Platform>>, files: Option<&Files>, dirs: Option<&Dirs>) -> Services {
+fn services(clipboard: &Rc<RefCell<Clip>>, platform: Option<&Rc<dyn Platform>>, files: Option<&Files>, dirs: Option<&Dirs>) -> Services {
     let file_dialog: Box<dyn Fn(_) -> _> = match files {
         // The system's picker, through the documents' mirrors (`files.rs`).
         Some(files) => {
@@ -821,6 +838,8 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<(String, serde_json::Value)>>,
         clipboard: RefCell<Option<String>>,
+        /// The longest text the clipboard takes (`None`: any).
+        clip_max: std::cell::Cell<Option<usize>>,
     }
 
     impl Platform for Fake {
@@ -829,8 +848,12 @@ mod tests {
             match op {
                 "clipboardGet" => self.clipboard.borrow().as_ref().map(|t| json!({"text": t})),
                 "clipboardSet" => {
-                    *self.clipboard.borrow_mut() = args.get("text").and_then(|t| t.as_str()).map(str::to_owned);
-                    None
+                    let text = args.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                    if self.clip_max.get().is_some_and(|max| text.len() > max) {
+                        return Some(json!({"ok": false}));
+                    }
+                    *self.clipboard.borrow_mut() = Some(text.to_owned());
+                    Some(json!({"ok": true}))
                 }
                 "grants" => Some(json!({"uris": []})),
                 "print" => Some(json!({"ok": true})),
@@ -879,6 +902,16 @@ mod tests {
         press(&mut host, code::A + 21, meta::CTRL_ON);
         step(&mut host);
         assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("from another app"));
+        // Too large for the system clipboard: the app pastes its own copy, not the older text in the system's.
+        fake.clip_max.set(Some(5));
+        press(&mut host, code::A, meta::CTRL_ON);
+        press(&mut host, code::A + 2, meta::CTRL_ON);
+        assert_eq!(fake.clipboard.borrow().as_deref(), Some("from another app"));
+        let all = host.app().session.doc.plain_text(StoryRef::Body);
+        press(&mut host, code::A + 21, meta::CTRL_ON);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).len() >= all.len(), "pasted over the selection with the same text");
+        assert_eq!(fake.ops("clipboardGet").len(), 1, "the system clipboard isn't asked while the app's copy is newer");
     }
 
     #[test]

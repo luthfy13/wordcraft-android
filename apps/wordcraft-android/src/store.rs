@@ -64,6 +64,18 @@ impl Dirs {
     }
 }
 
+/// Deletes the temporary files a write killed midway left in the app's folder.
+pub fn remove_leftovers(dirs: &Dirs) {
+    let Ok(list) = fs::read_dir(dirs.root()) else { return };
+    for f in list.flatten() {
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            let _ = fs::remove_file(f.path());
+        }
+    }
+}
+
 /// Loads what lives outside `ui.json` and must be in place before a document is laid out: added fonts and
 /// the Hunspell folder. Process-wide, like the desktop app's.
 pub fn load_fonts_and_dictionaries(dirs: &Dirs) {
@@ -136,14 +148,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no folder"))?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
     fs::create_dir_all(dir)?;
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(name);
-    temp_name.push(format!(".{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    let temp = dir.join(temp_name);
-    let written = OpenOptions::new().write(true).create_new(true).open(&temp).and_then(|mut f| {
+    // A name a killed earlier process may have left (process ids are reused): the next one.
+    let (temp, file) = (0..64)
+        .find_map(|_| {
+            let mut temp_name = std::ffi::OsString::from(".");
+            temp_name.push(name);
+            temp_name.push(format!(".{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let temp = dir.join(temp_name);
+            match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(f) => Some(Ok((temp, f))),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free temporary name")))?;
+    let written = (|| {
+        let mut f = file;
         f.write_all(bytes)?;
         f.sync_all()
-    });
+    })();
     match written.and_then(|()| fs::rename(&temp, path)) {
         Ok(()) => Ok(()),
         Err(e) => {
