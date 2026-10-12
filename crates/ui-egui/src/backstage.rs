@@ -279,8 +279,9 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
         let _ = app.run("ui.openFileDialog", json!({}));
     }
     // Linux and the BSDs (#576): the system dialog needs a file chooser portal or zenity; when it
-    // doesn't show up, WordCraft's own browser is always one click away.
-    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+    // doesn't show up, WordCraft's own browser is always one click away. Not on Android, whose
+    // document picker is always there and whose apps can't list the user's folders.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_arch = "wasm32")))]
     if ui
         .button(egui::RichText::new(tl!("Browse in WordCraft…")).font(medium(14.0)))
         .on_hover_text(tl!("Open a file with WordCraft's own browser when the system file dialog doesn't appear."))
