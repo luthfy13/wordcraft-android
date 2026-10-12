@@ -28,6 +28,16 @@ impl Dirs {
         Self { root: files_dir.join("wordcraft") }
     }
 
+    /// The folder itself (documents live in `docs/` there, see `files.rs`).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// PDFs handed to Android's print service.
+    pub fn print(&self) -> PathBuf {
+        self.root.join("print")
+    }
+
     /// The settings, as the desktop app's `ui.json`.
     pub fn prefs(&self) -> PathBuf {
         self.root.join("ui.json")

@@ -4,11 +4,13 @@
 //! Every Android call happens on the `android_main` thread. Calls that take android-activity's write
 //! lock (`enable_motion_axis`) are made before the loop: inside `poll_events` they would deadlock.
 
+mod bridge;
 mod entry;
 mod gfx;
 mod keychars;
 
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,7 @@ use ndk::native_window::NativeWindow;
 
 use crate::host::{Host, Launch, Window};
 use crate::input::{Action, FLAG_NO_FOCUS_CHANGE, KeyPress, Motion, Pointer, Tool};
+use crate::platform::{self, Platform, inbox};
 use crate::store::Dirs;
 use gfx::{Backend, Gpu, PaintJob, Painted, WindowSurface};
 use keychars::KeyChars;
@@ -45,6 +48,7 @@ pub(crate) fn main(app: AndroidApp) {
     app.enable_motion_axis(Axis::Hscroll);
     let mut state = State::new(app, &args);
     state.run();
+    inbox::set_waker(None);
     if state.host.quit_requested() {
         state.host.quit(FILES_WAIT);
     } else {
@@ -151,11 +155,15 @@ struct State {
 impl State {
     fn new(app: AndroidApp, args: &str) -> Self {
         let repaint = Arc::new(Repaint { at: Mutex::new(None), waker: app.create_waker() });
+        // Kotlin's reports wake the loop (and any that came before it are picked up).
+        let waker = app.create_waker();
+        inbox::set_waker(Some(Arc::new(move || waker.wake())));
+        let platform: Rc<dyn Platform> = Rc::new(bridge::AndroidPlatform);
         let mut state = Self {
             surface: None,
             gpu: None,
             window: None,
-            host: Host::new(&Launch::parse(args), app.internal_data_path().map(|p| Dirs::new(&p))),
+            host: Host::new(&Launch::parse(args), app.internal_data_path().map(|p| Dirs::new(&p)), Some(platform)),
             repaint,
             backend: Backend::parse(args),
             keys: KeyChars::default(),
@@ -193,6 +201,7 @@ impl State {
             app.poll_events(self.timeout(), |event| self.on_event(event));
             // Without draining every time, no further input arrives.
             self.drain_input();
+            self.drain_inbox();
             if self.quit {
                 break;
             }
@@ -211,9 +220,16 @@ impl State {
             if framed || self.upkeep.is_some_and(|t| t <= now) {
                 self.upkeep = self.host.maintain(now);
             }
-            if self.quit || self.host.quit_requested() {
-                // Returning from `android_main` finishes the activity.
+            if self.quit {
                 break;
+            }
+            // Returning from `android_main` finishes the activity, once documents are written back.
+            if self.host.quit_requested() {
+                if self.host.ready_to_quit() {
+                    break;
+                }
+                // Looks again when a write-back reports, or soon.
+                self.repaint.request(Duration::from_millis(250));
             }
         }
     }
@@ -352,9 +368,6 @@ impl State {
             Err(_) => return self.after_panic(),
         };
         let Some(mut frame) = frame else { return };
-        for url in &frame.urls {
-            log::info!("opening links comes in a later version: {url}");
-        }
         let Some(gpu) = self.gpu.as_mut() else {
             // Textures no renderer saw: the next device needs a new egui context.
             frame.textures.clear();
@@ -416,6 +429,23 @@ impl State {
         gfx::drop_guarded(self.gpu.take());
         self.had_gpu = true;
         self.attach();
+    }
+
+    /// Kotlin's reports (pickers, copies, write-backs, documents sent to the app).
+    fn drain_inbox(&mut self) {
+        let (reports, dropped) = inbox::take();
+        if dropped > 0 {
+            log::warn!("{dropped} reports from Android were dropped");
+        }
+        for report in reports {
+            match platform::parse(&report) {
+                Some(inbound) => {
+                    self.host.event(inbound);
+                    self.redraw = true;
+                }
+                None => log::warn!("a report from Android this version doesn't know"),
+            }
+        }
     }
 
     fn drain_input(&mut self) {

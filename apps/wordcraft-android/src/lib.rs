@@ -9,9 +9,12 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 mod crash;
+mod files;
 mod host;
 mod input;
 mod keymap;
+mod platform;
+mod prompts;
 mod recovery;
 mod store;
 

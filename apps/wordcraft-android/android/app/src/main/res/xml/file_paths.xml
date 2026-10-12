@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the share sheet may be given: the copies of documents the app saved (files/wordcraft/docs). -->
+<paths>
+    <files-path name="documents" path="wordcraft/docs/" />
+</paths>

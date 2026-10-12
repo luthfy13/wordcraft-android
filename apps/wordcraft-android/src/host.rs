@@ -6,17 +6,27 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::output::OutputCommand;
-use egui::{ClippedPrimitive, Event, RawInput, Rect, TexturesDelta, Theme, ViewportId, ViewportInfo, pos2};
+use egui::{ClippedPrimitive, CursorIcon, Event, RawInput, Rect, TexturesDelta, Theme, ViewportId, ViewportInfo, pos2};
+use serde_json::json;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
+use crate::files::{FileEvent, FileOp, Files};
 use crate::input::{KeyPress, Motion, Translator};
+use crate::keymap::code;
+use crate::platform::{self, Inbound, Platform};
+use crate::prompts::Prompts;
 use crate::recovery::Recovery;
 use crate::store::{self, Dirs};
+
+/// How long quitting waits for documents to be written back before giving up.
+const QUIT_WAIT: Duration = Duration::from_secs(15);
 
 /// What to open at start-up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,8 +66,6 @@ pub struct Frame {
     pub primitives: Vec<ClippedPrimitive>,
     pub textures: TexturesDelta,
     pub pixels_per_point: f32,
-    /// Links the user opened.
-    pub urls: Vec<String>,
 }
 
 /// The WordCraft app and egui, driven by the platform.
@@ -66,9 +74,22 @@ pub struct Host {
     app: WordApp,
     input: Translator,
     events: Vec<Event>,
-    /// Text copied in the app. The system clipboard comes in a later phase; until then copy and paste
-    /// work inside the app.
+    /// Text copied in the app: the clipboard without a platform (tests), and what's pasted when the
+    /// system clipboard can't be read.
     clipboard: Rc<RefCell<String>>,
+    /// Android, or `None` (tests: the app's own file browser and clipboard).
+    platform: Option<Rc<dyn Platform>>,
+    files: Option<Files>,
+    /// Documents to hand the app as dropped files in the next frame (Open with, Share).
+    dropped: Vec<PathBuf>,
+    prompts: Prompts,
+    /// The pointer's shape last sent.
+    cursor: Option<CursorIcon>,
+    /// The app's state when Back was pressed: if Back (as Esc) changes nothing, the app goes to the
+    /// background.
+    back: Option<BackState>,
+    /// Since when quitting waits for write-backs.
+    quitting: Option<Instant>,
     start: Instant,
     window: Option<Window>,
     focused: bool,
@@ -81,14 +102,15 @@ pub struct Host {
 
 impl Host {
     /// The app, with the settings and any unsaved document a previous run left in `dirs`.
-    pub fn new(launch: &Launch, dirs: Option<Dirs>) -> Self {
+    pub fn new(launch: &Launch, dirs: Option<Dirs>, platform: Option<Rc<dyn Platform>>) -> Self {
         let clipboard = Rc::new(RefCell::new(String::new()));
         // Added fonts before the first layout, as on the desktop.
         if let Some(dirs) = &dirs {
             store::load_fonts_and_dictionaries(dirs);
         }
+        let files = dirs.as_ref().filter(|_| platform.is_some()).map(|d| Files::new(d.root()));
         let doc = if launch.sample { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
-        let mut app = WordApp::new(Session::new(doc), services(&clipboard));
+        let mut app = WordApp::new(Session::new(doc), services(&clipboard, platform.as_ref(), files.as_ref(), dirs.as_ref()));
         let mut recovery = None;
         if let Some(dirs) = &dirs {
             store::load_prefs(dirs, &mut app);
@@ -103,7 +125,7 @@ impl Host {
         // versions: the "Join the ArtCraft community" button stays hidden, whatever the settings say.
         // About still names ArtCraft (that needs a hook in ui-egui).
         app.ui.show_discord = false;
-        Self {
+        let mut host = Self {
             ctx: new_context(),
             app,
             input: Translator::default(),
@@ -116,7 +138,16 @@ impl Host {
             max_texture_side: 2048,
             dirs,
             recovery,
-        }
+            platform,
+            files,
+            dropped: Vec::new(),
+            prompts: Prompts::default(),
+            cursor: None,
+            back: None,
+            quitting: None,
+        };
+        host.pump();
+        host
     }
 
     /// Keeps the recovery snapshot up to date; call after each frame and when [`Host::maintain`]'s time
@@ -131,7 +162,44 @@ impl Host {
         if let Some(r) = &mut self.recovery {
             r.flush(&mut self.app);
         }
+        if let Some(files) = &mut self.files {
+            files.save();
+        }
         self.save_prefs();
+    }
+
+    /// A report from the platform.
+    pub fn event(&mut self, inbound: Inbound) {
+        if let Some(files) = &mut self.files {
+            match inbound {
+                Inbound::File(event) => files.event(event, &mut self.app),
+                Inbound::Incoming(docs) => {
+                    for picked in docs {
+                        files.event(FileEvent::Incoming { picked }, &mut self.app);
+                    }
+                }
+            }
+        }
+        self.pump();
+        self.ctx.request_repaint();
+    }
+
+    /// Whether the app may close now that it asked to (File › Exit): not while a document is being
+    /// written back. If writing back failed, or takes too long, closing is cancelled and the user told.
+    pub fn ready_to_quit(&mut self) -> bool {
+        let Some(files) = &self.files else { return true };
+        if !files.unsynced() {
+            return true;
+        }
+        let since = *self.quitting.get_or_insert_with(Instant::now);
+        if files.writing() && since.elapsed() < QUIT_WAIT {
+            return false;
+        }
+        self.quitting = None;
+        self.app.quit_requested = false;
+        self.app.status("Not closed: a document couldn't be saved to its file. Save it again or use Save As.");
+        self.ctx.request_repaint();
+        false
     }
 
     /// The user quit (File › Exit, or closing the document): the settings are written and nothing is kept
@@ -168,7 +236,7 @@ impl Host {
     pub fn reset_context(&mut self) {
         let prefs = self.app.prefs();
         let session = std::mem::replace(&mut self.app.session, Session::new(wordcraft_doc::Document::new()));
-        let mut app = WordApp::new(session, services(&self.clipboard));
+        let mut app = WordApp::new(session, services(&self.clipboard, self.platform.as_ref(), self.files.as_ref(), self.dirs.as_ref()));
         app.apply_prefs(prefs);
         app.ui.show_discord = false;
         self.app = app;
@@ -185,6 +253,11 @@ impl Host {
     #[cfg(test)]
     pub fn app(&self) -> &WordApp {
         &self.app
+    }
+
+    #[cfg(test)]
+    pub fn app_mut(&mut self) -> &mut WordApp {
+        &mut self.app
     }
 
     /// The window appeared, changed or went away (`None`: frames are skipped until it's back).
@@ -243,8 +316,11 @@ impl Host {
     }
 
     pub fn key(&mut self, k: &KeyPress) {
-        let clipboard = &self.clipboard;
-        self.input.key(k, || Some(clipboard.borrow().clone()), &mut self.events);
+        if k.keycode == code::BACK && k.pressed && self.back.is_none() {
+            self.back = Some(BackState::of(&self.app, &self.ctx));
+        }
+        let (clipboard, platform) = (&self.clipboard, &self.platform);
+        self.input.key(k, || clipboard_text(platform.as_ref(), clipboard), &mut self.events);
     }
 
     /// Whether input is waiting for a frame.
@@ -276,29 +352,140 @@ impl Host {
             ViewportId::ROOT,
             ViewportInfo { native_pixels_per_point: Some(native), focused: Some(self.focused), minimized: Some(false), ..ViewportInfo::default() },
         );
+        raw.dropped_files = self.dropped.drain(..).map(|path| Arc::new(LocalFile(path)) as egui::DroppedFileHandle).collect();
         self.app.raw_input_hook(&mut raw);
-        let app = &mut self.app;
+        let (app, prompts, files, platform) = (&mut self.app, &mut self.prompts, &mut self.files, self.platform.as_deref());
         let out = self.ctx.run_ui(raw, |ui| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
             app.ui(ui);
+            prompts.show(ui, app, files.as_mut(), platform);
         });
-        let mut urls = Vec::new();
         for command in out.platform_output.commands {
             match command {
-                OutputCommand::CopyText(text) => *self.clipboard.borrow_mut() = text,
-                OutputCommand::OpenUrl(url) => urls.push(url.url),
+                OutputCommand::CopyText(text) => {
+                    if let Some(p) = &self.platform {
+                        p.call("clipboardSet", json!({"text": text}));
+                    }
+                    *self.clipboard.borrow_mut() = text;
+                }
+                OutputCommand::OpenUrl(url) => {
+                    if let Some(p) = &self.platform {
+                        p.call("openUrl", json!({"url": url.url}));
+                    }
+                }
                 OutputCommand::CopyImage(_) => {}
             }
         }
+        let cursor = out.platform_output.cursor_icon;
+        if self.cursor != Some(cursor) {
+            self.cursor = Some(cursor);
+            if let Some(p) = &self.platform {
+                p.call("pointerIcon", json!({"type": platform::pointer_icon(cursor)}));
+            }
+        }
+        if let Some(before) = self.back.take()
+            && before == BackState::of(&self.app, &self.ctx)
+            && let Some(p) = &self.platform
+        {
+            // Back with nothing to close: the app goes to the background, as at any app's root.
+            p.call("moveTaskToBack", json!({}));
+        }
+        self.pump();
         let primitives = self.ctx.tessellate(out.shapes, out.pixels_per_point);
-        Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point, urls })
+        Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point })
+    }
+
+    /// Hands the platform what the documents need (pickers, copies, write-backs) and the app what came of
+    /// it (documents to open, messages).
+    fn pump(&mut self) {
+        let Some(files) = &mut self.files else { return };
+        files.after_frame(&mut self.app);
+        // A synchronous answer can produce more work: a few rounds at most.
+        for _ in 0..4 {
+            let ops = files.take_ops();
+            if ops.is_empty() {
+                break;
+            }
+            for op in ops {
+                let (name, args) = platform::file_op(&op);
+                let answer = self.platform.as_ref().and_then(|p| p.call(name, args));
+                if op == FileOp::ListGrants
+                    && let Some(uris) = answer.as_ref().and_then(platform::grants)
+                {
+                    files.event(FileEvent::Grants { uris }, &mut self.app);
+                }
+            }
+        }
+        self.dropped.extend(files.take_to_open());
+        if let Some(message) = files.take_notices().pop() {
+            self.app.status(message);
+        }
+        let now = self.ctx.input(|i| i.time);
+        for exported in files.take_exports() {
+            self.prompts.exported(exported, now);
+        }
+        if !self.dropped.is_empty() {
+            self.ctx.request_repaint();
+        }
     }
 
     /// Whether the app asked to quit (File › Close on the last document, or Exit).
     pub fn quit_requested(&self) -> bool {
         self.app.quit_requested
     }
+}
+
+/// What Back (sent as Esc) may close or end; when none of it changes, Back leaves the app.
+#[derive(PartialEq)]
+struct BackState {
+    dialog: bool,
+    file_dialog: bool,
+    backstage: bool,
+    colors: bool,
+    popup: bool,
+    math: bool,
+    painter: bool,
+    read_mode: bool,
+    sel: wordcraft_engine::Selection,
+    modes: String,
+}
+
+impl BackState {
+    fn of(app: &WordApp, ctx: &egui::Context) -> Self {
+        Self {
+            dialog: app.dialog.is_some(),
+            file_dialog: app.file_dialog_open(),
+            backstage: app.ui.backstage,
+            colors: app.colors.is_some(),
+            popup: egui::Popup::is_any_open(ctx),
+            math: app.session.math.is_some(),
+            painter: app.session.painter.is_some(),
+            read_mode: app.session.view.read_mode,
+            sel: app.session.sel.clone(),
+            modes: format!("{:?} {:?}", app.session.view.draw.mode, app.ui.keytips),
+        }
+    }
+}
+
+/// A document handed to the app as a dropped file.
+#[derive(Debug)]
+struct LocalFile(PathBuf);
+
+impl egui::DroppedFile for LocalFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+/// The system clipboard's text, else what was copied in the app.
+fn clipboard_text(platform: Option<&Rc<dyn Platform>>, own: &Rc<RefCell<String>>) -> Option<String> {
+    let system = platform.and_then(|p| p.call("clipboardGet", json!({}))).and_then(|v| v.get("text")?.as_str().map(str::to_owned));
+    system.or_else(|| Some(own.borrow().clone())).filter(|t| !t.is_empty())
 }
 
 /// egui as eframe sets it up on a phone or tablet: one window, so viewports are embedded, and up to two
@@ -310,19 +497,44 @@ fn new_context() -> egui::Context {
     ctx
 }
 
-fn services(clipboard: &Rc<RefCell<String>>) -> Services {
-    Services {
-        // No system file dialog yet: the app's own file browser opens instead (an `Err` answer).
-        file_dialog: Some(Box::new(|_| {
+fn services(clipboard: &Rc<RefCell<String>>, platform: Option<&Rc<dyn Platform>>, files: Option<&Files>, dirs: Option<&Dirs>) -> Services {
+    let file_dialog: Box<dyn Fn(_) -> _> = match files {
+        // The system's picker, through the documents' mirrors (`files.rs`).
+        Some(files) => {
+            let dialogs = files.dialogs();
+            Box::new(move |req| crate::files::Dialogs::ask(&dialogs, req))
+        }
+        // No platform: the app's own file browser (an `Err` answer).
+        None => Box::new(|_| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = tx.send(Err("Android has no file dialog in this version".to_owned()));
+            let _ = tx.send(Err("no system file dialog".to_owned()));
             rx
-        })),
+        }),
+    };
+    let print = platform.zip(dirs).map(|(platform, dirs)| {
+        let (platform, dir) = (Rc::clone(platform), dirs.print());
+        Box::new(move |pdf: &[u8]| print(platform.as_ref(), &dir, pdf)) as Box<dyn Fn(&[u8]) -> Result<(), String>>
+    });
+    Services {
+        file_dialog: Some(file_dialog),
         clipboard_text: Some(Box::new({
-            let clipboard = Rc::clone(clipboard);
-            move || Some(clipboard.borrow().clone()).filter(|t| !t.is_empty())
+            let (clipboard, platform) = (Rc::clone(clipboard), platform.cloned());
+            move || clipboard_text(platform.as_ref(), &clipboard)
         })),
+        print,
         ..Services::default()
+    }
+}
+
+/// File › Print: the PDF goes to Android's print service, which shows its own dialog (printers, Save as
+/// PDF). Earlier print files are deleted (the print service reads the file only while its dialog is open).
+fn print(platform: &dyn Platform, dir: &Path, pdf: &[u8]) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dir);
+    let path = dir.join("document.pdf");
+    store::write_atomic(&path, pdf).map_err(|e| e.to_string())?;
+    match platform.call("print", json!({"path": path.to_string_lossy(), "name": "Folio Writer document"})) {
+        Some(v) if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => Ok(()),
+        _ => Err("printing isn't available".to_owned()),
     }
 }
 
@@ -346,7 +558,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        let mut host = Host::new(&Launch { sample: true }, None);
+        let mut host = Host::new(&Launch { sample: true }, None, None);
         host.set_window(Some(tablet()));
         host.set_max_texture_side(8192);
         host
@@ -362,7 +574,7 @@ mod tests {
 
     #[test]
     fn no_window_no_frame() {
-        let mut host = Host::new(&Launch::default(), None);
+        let mut host = Host::new(&Launch::default(), None, None);
         assert!(step(&mut host).is_none());
         host.set_window(Some(tablet()));
         assert!(step(&mut host).is_some());
@@ -465,5 +677,131 @@ mod tests {
         }
         host.set_focused(false);
         step(&mut host);
+    }
+
+    /// Android, as far as the host can tell: records the calls, answers the clipboard.
+    #[derive(Default)]
+    struct Fake {
+        calls: RefCell<Vec<(String, serde_json::Value)>>,
+        clipboard: RefCell<Option<String>>,
+    }
+
+    impl Platform for Fake {
+        fn call(&self, op: &str, args: serde_json::Value) -> Option<serde_json::Value> {
+            self.calls.borrow_mut().push((op.to_owned(), args.clone()));
+            match op {
+                "clipboardGet" => self.clipboard.borrow().as_ref().map(|t| json!({"text": t})),
+                "clipboardSet" => {
+                    *self.clipboard.borrow_mut() = args.get("text").and_then(|t| t.as_str()).map(str::to_owned);
+                    None
+                }
+                "grants" => Some(json!({"uris": []})),
+                "print" => Some(json!({"ok": true})),
+                _ => None,
+            }
+        }
+    }
+
+    impl Fake {
+        fn ops(&self, op: &str) -> Vec<serde_json::Value> {
+            self.calls.borrow().iter().filter(|(o, _)| o == op).map(|(_, a)| a.clone()).collect()
+        }
+    }
+
+    fn android(dirs: Option<Dirs>) -> (Host, Rc<Fake>) {
+        let fake = Rc::new(Fake::default());
+        let mut host = Host::new(&Launch { sample: true }, dirs, Some(Rc::clone(&fake) as Rc<dyn Platform>));
+        host.set_window(Some(tablet()));
+        host.set_max_texture_side(8192);
+        for _ in 0..3 {
+            step(&mut host);
+        }
+        (host, fake)
+    }
+
+    fn press(host: &mut Host, keycode: u32, meta_state: u32) {
+        host.sync_modifiers(meta_state);
+        host.key(&KeyPress { keycode, meta_state, pressed: true, typed: None });
+        host.key(&KeyPress { keycode, meta_state, pressed: false, typed: None });
+        step(host);
+    }
+
+    #[test]
+    fn copy_and_paste_use_the_system_clipboard() {
+        let (mut host, fake) = android(None);
+        press(&mut host, code::A, meta::CTRL_ON);
+        press(&mut host, code::A + 2, meta::CTRL_ON);
+        let copied = fake.clipboard.borrow().clone().expect("copied to the system clipboard");
+        assert!(copied.len() > 100);
+        // Text copied in another app is pasted.
+        *fake.clipboard.borrow_mut() = Some("from another app".into());
+        press(&mut host, code::A + 21, meta::CTRL_ON);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("from another app"));
+    }
+
+    #[test]
+    fn back_closes_what_is_open_else_leaves_the_app() {
+        let (mut host, fake) = android(None);
+        host.app_mut().ui.backstage = true;
+        step(&mut host);
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert!(!host.app().ui.backstage, "Back closed the backstage");
+        assert!(fake.ops("moveTaskToBack").is_empty());
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert_eq!(fake.ops("moveTaskToBack").len(), 1, "nothing open: the app goes to the background");
+    }
+
+    #[test]
+    fn the_pointer_shape_is_sent_when_it_changes() {
+        let (mut host, fake) = android(None);
+        let sent = fake.ops("pointerIcon").len();
+        assert_eq!(sent, 1, "once at the start");
+        for _ in 0..3 {
+            step(&mut host);
+        }
+        assert_eq!(fake.ops("pointerIcon").len(), sent, "not again while it stays");
+    }
+
+    #[test]
+    fn a_document_sent_to_the_app_opens() {
+        let root = crate::store::tests::temp_dir("host-incoming");
+        let (mut host, fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(fake.ops("grants").len(), 1);
+        host.event(Inbound::Incoming(vec![crate::files::Picked {
+            uri: "content://x/doc/1".into(),
+            name: "Minutes.docx".into(),
+            writable: true,
+            ..Default::default()
+        }]));
+        let copy = fake.ops("copyIn").pop().expect("copied in");
+        let path = PathBuf::from(copy["path"].as_str().unwrap());
+        // Android copies it.
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        s.run("text.insert", &json!({"text": "Minutes of the meeting"})).unwrap();
+        wordcraft_engine::io::save_path_with(&path, &s.doc, None, &Default::default()).unwrap();
+        let req = copy["req"].as_u64().unwrap();
+        host.event(platform::parse(&json!({"event": "copiedIn", "req": req, "remote": {"size": 1}}).to_string()).unwrap());
+        step(&mut host);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("Minutes of the meeting"));
+        assert_eq!(host.app().session.path.as_deref(), Some(path.as_path()));
+        // Saving writes it back to Android's document.
+        press(&mut host, code::A + 18, meta::CTRL_ON);
+        assert!(fake.ops("writeBack").iter().any(|w| w["uri"] == "content://x/doc/1"), "{:?}", fake.calls.borrow());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn printing_hands_a_pdf_to_android() {
+        let root = crate::store::tests::temp_dir("host-print");
+        let (mut host, fake) = android(Some(Dirs::new(&root)));
+        host.app_mut().run("ui.print", json!({})).unwrap();
+        let print = fake.ops("print").pop().expect("print");
+        let pdf = std::fs::read(print["path"].as_str().unwrap()).unwrap();
+        assert!(pdf.starts_with(b"%PDF"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
