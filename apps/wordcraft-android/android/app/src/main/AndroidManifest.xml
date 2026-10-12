@@ -2,9 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Back goes to the app (MainActivity hands it over as the Back key, which the app treats as Esc): the
-         activity isn't closed behind the user's work. -->
+         activity isn't closed behind the user's work. Backups keep the settings, never documents
+         (res/xml/data_extraction_rules.xml). -->
     <application
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:resizeableActivity="true"

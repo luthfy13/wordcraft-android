@@ -8,6 +8,7 @@ mod entry;
 mod gfx;
 mod keychars;
 
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use ndk::native_window::NativeWindow;
 
 use crate::host::{Host, Launch, Window};
 use crate::input::{Action, FLAG_NO_FOCUS_CHANGE, KeyPress, Motion, Pointer, Tool};
+use crate::store::Dirs;
 use gfx::{Backend, Gpu, PaintJob, Painted, WindowSurface};
 use keychars::KeyChars;
 
@@ -28,6 +30,11 @@ const FLAG_CANCELED: u32 = 0x20;
 /// Waits before attaching a window again after attaching failed: doubling from the first to the last.
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(8);
+/// How long leaving waits for the settings and the recovery snapshot to reach storage.
+const FILES_WAIT: Duration = Duration::from_secs(2);
+/// Panics in frames this close together end the app (the next start recovers the document).
+const PANIC_WINDOW: Duration = Duration::from_secs(60);
+const PANICS_MAX: usize = 3;
 
 pub(crate) fn main(app: AndroidApp) {
     init_logging();
@@ -38,6 +45,14 @@ pub(crate) fn main(app: AndroidApp) {
     app.enable_motion_axis(Axis::Hscroll);
     let mut state = State::new(app, &args);
     state.run();
+    if state.host.quit_requested() {
+        state.host.quit(FILES_WAIT);
+    } else {
+        state.host.persist();
+        if !state.host.wait_for_files(FILES_WAIT) {
+            log::warn!("the recovery snapshot wasn't written in time");
+        }
+    }
     log::info!("Folio Writer stopping");
 }
 
@@ -124,6 +139,10 @@ struct State {
     presented: u32,
     /// When `android_main` started: the first frame's log line says how long it took.
     started: Instant,
+    /// When the host's upkeep (the recovery snapshot) is next due.
+    upkeep: Option<Instant>,
+    /// When frames panicked lately.
+    panics: Vec<Instant>,
     /// Debug builds: `--panic-test` panics after the first frames, so CI sees a panic reach logcat.
     #[cfg(debug_assertions)]
     panic_test: bool,
@@ -136,7 +155,7 @@ impl State {
             surface: None,
             gpu: None,
             window: None,
-            host: Host::new(&Launch::parse(args)),
+            host: Host::new(&Launch::parse(args), app.internal_data_path().map(|p| Dirs::new(&p))),
             repaint,
             backend: Backend::parse(args),
             keys: KeyChars::default(),
@@ -150,6 +169,8 @@ impl State {
             skips: 0,
             presented: 0,
             started: Instant::now(),
+            upkeep: None,
+            panics: Vec::new(),
             #[cfg(debug_assertions)]
             panic_test: args.split_whitespace().any(|a| a == "--panic-test"),
             app,
@@ -180,28 +201,34 @@ impl State {
                 self.attach();
             }
             let due = self.repaint.take_due(now);
+            let mut framed = false;
             if self.surface.is_some() && (self.redraw || due || self.host.has_events()) {
                 self.redraw = false;
                 self.frame();
+                framed = true;
             }
-            if self.host.quit_requested() {
+            let now = Instant::now();
+            if framed || self.upkeep.is_some_and(|t| t <= now) {
+                self.upkeep = self.host.maintain(now);
+            }
+            if self.quit || self.host.quit_requested() {
                 // Returning from `android_main` finishes the activity.
                 break;
             }
         }
     }
 
-    /// How long to wait for events: not at all when a frame is due, until egui's next repaint, or, with
-    /// nothing to draw on, until the next attempt to attach the window (or indefinitely).
+    /// How long to wait for events: not at all when a frame is due, else until egui's next repaint (with a
+    /// surface) or the next attempt to attach the window (without), or the host's upkeep, whichever
+    /// comes first. With none of these, indefinitely.
     fn timeout(&self) -> Option<Duration> {
         let now = Instant::now();
-        if self.surface.is_none() {
-            return self.retry.map(|t| whole_ms(t.saturating_duration_since(now)));
-        }
-        if self.redraw || self.host.has_events() {
+        if self.surface.is_some() && (self.redraw || self.host.has_events()) {
             return Some(Duration::ZERO);
         }
-        self.repaint.wait(now).map(whole_ms)
+        let next = if self.surface.is_some() { self.repaint.wait(now) } else { self.retry.map(|t| t.saturating_duration_since(now)) };
+        let upkeep = self.upkeep.map(|t| t.saturating_duration_since(now));
+        next.into_iter().chain(upkeep).min().map(whole_ms)
     }
 
     fn on_event(&mut self, event: PollEvent<'_>) {
@@ -232,6 +259,8 @@ impl State {
                 self.redraw = true;
             }
             MainEvent::LowMemory => log::info!("the system is low on memory"),
+            // The app may be killed from here on without another word.
+            MainEvent::Pause | MainEvent::Stop => self.host.persist(),
             MainEvent::Destroy => self.quit = true,
             _ => {}
         }
@@ -317,7 +346,12 @@ impl State {
     }
 
     fn frame(&mut self) {
-        let Some(mut frame) = self.host.frame() else { return };
+        // A panic in the app's interface code: the document survives, the interface starts again.
+        let frame = match std::panic::catch_unwind(AssertUnwindSafe(|| self.host.frame())) {
+            Ok(frame) => frame,
+            Err(_) => return self.after_panic(),
+        };
+        let Some(mut frame) = frame else { return };
         for url in &frame.urls {
             log::info!("opening links comes in a later version: {url}");
         }
@@ -363,6 +397,25 @@ impl State {
         if self.panic_test && self.presented >= 3 {
             panic_test();
         }
+    }
+
+    /// After a frame panicked (the hook logged it): a snapshot of the document first, then a new egui
+    /// context and graphics device, as after a lost device. Panics in a row end the app.
+    fn after_panic(&mut self) {
+        self.host.persist();
+        let now = Instant::now();
+        self.panics.retain(|t| now.duration_since(*t) < PANIC_WINDOW);
+        self.panics.push(now);
+        if self.panics.len() >= PANICS_MAX {
+            log::error!("the interface panicked {} times in a minute: closing (the document is kept for the next start)", self.panics.len());
+            self.quit = true;
+            return;
+        }
+        log::error!("the interface panicked: starting it again");
+        self.drop_surface();
+        gfx::drop_guarded(self.gpu.take());
+        self.had_gpu = true;
+        self.attach();
     }
 
     fn drain_input(&mut self) {

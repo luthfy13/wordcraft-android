@@ -12,6 +12,8 @@ mod crash;
 mod host;
 mod input;
 mod keymap;
+mod recovery;
+mod store;
 
 #[cfg(target_os = "android")]
 mod android;

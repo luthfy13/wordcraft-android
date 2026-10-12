@@ -5064,9 +5064,11 @@ dependencies = [
  "log",
  "ndk",
  "pollster 0.4.0",
+ "serde_json",
  "wgpu",
  "wordcraft-doc",
  "wordcraft-engine",
+ "wordcraft-fonts",
  "wordcraft-ui-egui",
 ]
 

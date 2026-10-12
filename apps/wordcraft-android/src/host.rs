@@ -15,6 +15,8 @@ use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
 use crate::input::{KeyPress, Motion, Translator};
+use crate::recovery::Recovery;
+use crate::store::{self, Dirs};
 
 /// What to open at start-up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -72,16 +74,34 @@ pub struct Host {
     focused: bool,
     system_theme: Option<Theme>,
     max_texture_side: usize,
+    /// The app's files; `None` keeps nothing between runs (tests).
+    dirs: Option<Dirs>,
+    recovery: Option<Recovery>,
 }
 
 impl Host {
-    pub fn new(launch: &Launch) -> Self {
+    /// The app, with the settings and any unsaved document a previous run left in `dirs`.
+    pub fn new(launch: &Launch, dirs: Option<Dirs>) -> Self {
         let clipboard = Rc::new(RefCell::new(String::new()));
+        // Added fonts before the first layout, as on the desktop.
+        if let Some(dirs) = &dirs {
+            store::load_fonts_and_dictionaries(dirs);
+        }
         let doc = if launch.sample { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
         let mut app = WordApp::new(Session::new(doc), services(&clipboard));
+        let mut recovery = None;
+        if let Some(dirs) = &dirs {
+            store::load_prefs(dirs, &mut app);
+            let mut r = Recovery::new(dirs.recovery());
+            if let Some(message) = r.restore(&mut app) {
+                log::info!("{message}");
+                app.status(message);
+            }
+            recovery = Some(r);
+        }
         // The ArtCraft brand licence (docs/brand/LICENSE-brand.txt) keeps its marks out of modified
-        // versions. This only hides the "Join the ArtCraft community" button by default: Options can still
-        // show it, and About still names ArtCraft (both need a hook in ui-egui, decided with the owner).
+        // versions: the "Join the ArtCraft community" button stays hidden, whatever the settings say.
+        // About still names ArtCraft (that needs a hook in ui-egui).
         app.ui.show_discord = false;
         Self {
             ctx: new_context(),
@@ -94,6 +114,46 @@ impl Host {
             focused: true,
             system_theme: None,
             max_texture_side: 2048,
+            dirs,
+            recovery,
+        }
+    }
+
+    /// Keeps the recovery snapshot up to date; call after each frame and when [`Host::maintain`]'s time
+    /// comes. Returns when to call again.
+    pub fn maintain(&mut self, now: Instant) -> Option<Instant> {
+        self.recovery.as_mut()?.observe(&mut self.app, now)
+    }
+
+    /// The app is leaving the screen (Pause, Stop) or going away (Destroy) and may be killed without
+    /// warning: the settings and a snapshot of unsaved changes are written.
+    pub fn persist(&mut self) {
+        if let Some(r) = &mut self.recovery {
+            r.flush(&mut self.app);
+        }
+        self.save_prefs();
+    }
+
+    /// The user quit (File › Exit, or closing the document): the settings are written and nothing is kept
+    /// to recover, the user having saved or discarded the changes. Waits up to `timeout` for the files.
+    pub fn quit(&mut self, timeout: std::time::Duration) {
+        self.save_prefs();
+        if let Some(r) = &mut self.recovery {
+            r.discard();
+        }
+        self.wait_for_files(timeout);
+    }
+
+    /// Waits up to `timeout` for the recovery snapshot to be written; whether it was.
+    pub fn wait_for_files(&self, timeout: std::time::Duration) -> bool {
+        self.recovery.as_ref().is_none_or(|r| r.wait(timeout))
+    }
+
+    fn save_prefs(&self) {
+        if let Some(dirs) = &self.dirs
+            && let Err(e) = store::save_prefs(dirs, &self.app)
+        {
+            log::error!("can't save the settings: {e}");
         }
     }
 
@@ -110,6 +170,7 @@ impl Host {
         let session = std::mem::replace(&mut self.app.session, Session::new(wordcraft_doc::Document::new()));
         let mut app = WordApp::new(session, services(&self.clipboard));
         app.apply_prefs(prefs);
+        app.ui.show_discord = false;
         self.app = app;
         self.ctx = new_context();
         self.input = Translator::default();
@@ -285,7 +346,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        let mut host = Host::new(&Launch { sample: true });
+        let mut host = Host::new(&Launch { sample: true }, None);
         host.set_window(Some(tablet()));
         host.set_max_texture_side(8192);
         host
@@ -301,7 +362,7 @@ mod tests {
 
     #[test]
     fn no_window_no_frame() {
-        let mut host = Host::new(&Launch::default());
+        let mut host = Host::new(&Launch::default(), None);
         assert!(step(&mut host).is_none());
         host.set_window(Some(tablet()));
         assert!(step(&mut host).is_some());
