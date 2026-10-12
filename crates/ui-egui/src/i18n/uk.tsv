@@ -1440,6 +1440,8 @@
 	Border lines	Лінії меж
 	Capitalize first letter of sentences	Перша літера речення велика
 	Capitalize first letter of table cells	Перша літера в клітинках таблиці велика
+	Correct TWo INitial CApitals	Виправляти ДВі ВЕликі літери на початку слова
+	Correct accidental usage of cAPS LOCK key	Виправляти випадкове натискання cAPS LOCK
 	Capitalize names of days	Назви днів із великої літери
 	Case changes	Зміни регістру
 	Character level	Рівень символів
@@ -1703,6 +1705,7 @@
 	Middle	Посередині
 	Click the empty text box the text should continue in (Esc cancels)	Клацніть порожнє текстове поле, у якому має продовжитися текст (Esc — скасувати)
 	Not linked: click a text box	Не зв'язано: клацніть текстове поле
+	Show KeyTips (Alt or F10)	Показувати підказки клавіш (Alt або F10)
 	Location	Розташування
 	Endnotes	Кінцеві виноски
 	Below text	Під текстом
@@ -1715,6 +1718,10 @@
 	Continuous numbering	Наскрізна нумерація
 	Apply	Застосувати
 	Convert Notes	Перетворити примітки
+	Reading	Читання
+	Reading Column Width	Ширина стовпця для читання
+	Reading Line Spacing	Міжрядковий інтервал для читання
+	Reading Text Size	Розмір тексту для читання
 	English (United Kingdom)	Англійська (Велика Британія)
 	Polish	Польська
 	Do Not Check Spelling or Grammar	Не перевіряти правопис і граматику

@@ -634,6 +634,61 @@ fn shift_f5_goes_back_through_the_last_edits() {
     assert!(Session::new(wordcraft_doc::Document::new()).run("edit.goBack", &json!({})).is_err(), "nothing edited yet");
 }
 
+#[test]
+fn two_initial_capitals_are_corrected() {
+    let s = typed("the WOrd and THe end, not IDs or CDs. TV is fine ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "The Word and The end, not IDs or CDs. TV is fine ");
+    // "TEh" loses its second capital, then the replacement list fixes the typo.
+    assert_eq!(typed("TEh ").doc.plain_text(StoryRef::Body), "The ");
+    // A user exception.
+    let mut s = typed("");
+    run(&mut s, "tools.autocorrect", json!({"addInitialCapsException": "WCraft"}));
+    typ(&mut s, "WCraft ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "WCraft ");
+}
+
+#[test]
+fn accidental_caps_lock_is_corrected() {
+    let s = typed("a wORD and hELLO there. iOS stays ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "A Word and Hello there. iOS stays ");
+}
+
+#[test]
+fn capitalisation_fixes_undo_and_turn_off() {
+    let mut s = typed("WOrd");
+    typ(&mut s, " ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "Word ");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "WOrd ");
+    let mut s = typed("x wORD");
+    typ(&mut s, " ");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "X wORD ");
+    let mut s = typed("");
+    run(&mut s, "tools.autocorrect", json!({"twoInitialCaps": false, "capsLock": false}));
+    typ(&mut s, "x WOrd wORD ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "X WOrd wORD ");
+}
+
+#[test]
+fn first_letter_of_a_table_cell_is_capitalised() {
+    let cell_text = |s: &Session, c: usize| {
+        s.doc.body.iter().find_map(|b| b.as_table()).and_then(|t| t.rows.first()?.cells.get(c)?.blocks.first()?.as_para().map(|p| p.text.clone()))
+    };
+    let mut s = typed("");
+    run(&mut s, "insert.table", json!({"rows": 1, "cols": 2}));
+    typ(&mut s, "apples and pears\tplums ");
+    assert_eq!(cell_text(&s, 0).as_deref(), Some("Apples and pears"));
+    assert_eq!(cell_text(&s, 1).as_deref(), Some("Plums "));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(cell_text(&s, 1).as_deref(), Some("plums "));
+    let mut s = typed("");
+    run(&mut s, "tools.autocorrect", json!({"capCells": false}));
+    run(&mut s, "insert.table", json!({"rows": 1, "cols": 1}));
+    typ(&mut s, "plums ");
+    assert_eq!(cell_text(&s, 0).as_deref(), Some("plums "));
+}
+
 /// File › Options › Advanced, "Typing replaces selected text" (#485): on (Word's default) the
 /// typed text replaces the selection; off, it goes in front of the selection and keeps it.
 #[test]
@@ -704,4 +759,40 @@ fn plain_text_paste_keeps_an_empty_paragraph_in_a_list() {
     run(&mut s, "para.bullets", json!({}));
     typ(&mut s, "A\n\nB");
     assert_eq!(paras(&s), vec![para("A", Some(0)), para("B", None)]);
+}
+
+/// #713: Arabic or Hebrew typed into an empty paragraph makes it right-to-left; a paragraph that
+/// already has letters, or whose style sets a direction, keeps its own.
+#[test]
+fn typing_rtl_letters_into_an_empty_paragraph_makes_it_rtl() {
+    let bidi = |s: &Session, i: usize| s.doc.body.iter().filter_map(|b| b.as_para()).nth(i).and_then(|p| p.props.bidi);
+    // Empty paragraph: the first Arabic letter flips it, the rest keep it.
+    let s = typed("سلام");
+    assert_eq!(bidi(&s, 0), Some(true));
+    // Digits first, then Arabic: still no letters before, so it flips.
+    let s = typed("1. سلام");
+    assert_eq!(bidi(&s, 0), Some(true));
+    // Latin first: Arabic typed later doesn't flip the paragraph.
+    let s = typed("Hello سلام");
+    assert_eq!(bidi(&s, 0), None);
+    // A new paragraph after an RTL one starts its own detection.
+    let s = typed("سلام\nHello");
+    assert_eq!(bidi(&s, 1), Some(true), "Enter carries the paragraph's direction on, as in Word");
+    // A style that sets left-to-right wins.
+    let mut doc = Session::new(wordcraft_doc::Document::new());
+    if let Some(st) = doc.doc.styles.get_mut("Normal") {
+        st.para.bidi = Some(false);
+    }
+    typ(&mut doc, "سلام");
+    assert_eq!(bidi(&doc, 0), None);
+    // An opened paragraph without w:bidi lays out left-to-right whatever its text: the caret
+    // after the Arabic word sits near the left margin, not the right one.
+    let mut doc = typed("سلام");
+    let path = doc.sel.focus.path.clone();
+    if let Ok(p) = doc.doc.para_mut(StoryRef::Body, &path) {
+        p.props.bidi = None;
+        p.touch();
+    }
+    let x = doc.layout().caret(&doc.sel.focus).map(|c| c.x).unwrap_or(f32::MAX);
+    assert!(x < 300.0, "left-to-right paragraph: caret at {x}");
 }

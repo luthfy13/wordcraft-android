@@ -14,10 +14,13 @@ use wordcraft_doc::{Block, Blocks, InlineObject, Paragraph, PartKind, RevisionKi
 use super::Reader;
 use super::props::{sectpr, tcpr, trpr};
 use super::shape_style::{preset_kind, shape_paint, vml_color};
-use crate::package::{Rels, rt};
+use crate::package::{ContentTypes, Rels, rt};
 use crate::units::{int, measure, u32_of};
-use crate::xml::El;
+use crate::xml::{El, Node};
 use wordcraft_doc::wordart::TextWarp;
+
+const INK_URI: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingInk";
+const INK_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml";
 
 /// Deepest table nesting we build (deeper tables become plain paragraphs).
 const MAX_TABLE_DEPTH: usize = 24;
@@ -163,7 +166,7 @@ fn clean_text(s: &str) -> String {
 
 fn children_of_choice(ac: &El) -> Option<&El> {
     // Prefer a Choice whose requirements we understand; else the Fallback; else any Choice.
-    const KNOWN: &[&str] = &["wps", "wpg", "wpc", "w14", "w15", "wp14", "a14", "w16se", "w16cid", "w16", "w16cex", "w16sdtdh", "v"];
+    const KNOWN: &[&str] = &["wps", "wpg", "wpc", "wpi", "w14", "w15", "wp14", "a14", "w16se", "w16cid", "w16", "w16cex", "w16sdtdh", "v"];
     let ok = |c: &El| c.attr("Requires").unwrap_or("").split_whitespace().all(|r| KNOWN.contains(&r));
     ac.children("mc:Choice").find(|c| ok(c)).or_else(|| ac.child("mc:Fallback")).or_else(|| ac.child("mc:Choice"))
 }
@@ -500,7 +503,10 @@ impl Reader<'_> {
                 }
             }
             "mc:AlternateContent" => {
-                if let Some(c) = children_of_choice(k) {
+                if let Some(o) = self.read_ink_alternate(sc, k, rels) {
+                    let props = self.run_props_none(ctx);
+                    self.emit_obj(sc, pb, o, &props);
+                } else if let Some(c) = children_of_choice(k) {
                     self.read_inline_children(sc, pb, c, rels, ctx, depth + 1);
                 }
             }
@@ -661,7 +667,9 @@ impl Reader<'_> {
             }
             "w:ruby" => self.read_ruby(sc, pb, k, props),
             "mc:AlternateContent" => {
-                if let Some(c) = children_of_choice(k) {
+                if let Some(o) = self.read_ink_alternate(sc, k, rels) {
+                    self.emit_obj(sc, pb, o, props);
+                } else if let Some(c) = children_of_choice(k) {
                     for x in c.els() {
                         self.read_run_child(sc, pb, x, props, rels, note, depth + 1);
                     }
@@ -881,6 +889,25 @@ impl Reader<'_> {
         let gd = c.child("a:graphic").and_then(|g| g.child("a:graphicData"))?;
         // Checked by URI before the blip search: a diagram's data can hold a blip further down.
         let uri = gd.attr("uri").unwrap_or("");
+        if uri == INK_URI {
+            let content = gd.child("w14:contentPart")?;
+            let part = super::part_of(rels, content.attr("r:id")?, INK_REL)?;
+            let pkg = self.pkg;
+            if self.content_types.get_or_insert_with(|| ContentTypes::read(pkg)).of(&part) != Some("application/inkml+xml") {
+                return None;
+            }
+            let source = self.keep_embedded(c.child("a:graphic")?, rels, &[])?;
+            float.set_spin(xfrm_spin(content.child("w14:xfrm")));
+            let (px, py) = float.spin_pad(w, h);
+            for (e, p) in float.effect.iter_mut().zip([px, py, px, py]) {
+                *e = (*e - p).clamp(0.0, 1584.0);
+            }
+            // The renderer's existing missing-picture box marks ink without a usable preview.
+            // InkML stays opaque: no approximation of its strokes or conversion to freeforms.
+            let items = vec![GraphicItem::Image { rect: [0.0, 0.0, w, h], media: String::new() }];
+            let graphic = Arc::new(Graphic { kind: GraphicKind::Ink, items, w, h, source: Some(source), ..Default::default() });
+            return Some(InlineObject::Graphic { w, h, alt, float, graphic });
+        }
         let graphic_kind = if uri.ends_with("/chart") {
             Some(GraphicKind::Chart)
         } else if uri.ends_with("/diagram") {
@@ -892,7 +919,7 @@ impl Reader<'_> {
             // Kept so saving writes the chart or diagram back: the frame around it is written
             // from the object's (possibly moved or resized) size and position.
             let extra: Vec<String> = match kind {
-                GraphicKind::Chart => Vec::new(),
+                GraphicKind::Chart | GraphicKind::Ink => Vec::new(),
                 GraphicKind::Diagram => self.diagram_drawing_rel(gd, rels).into_iter().collect(),
             };
             let source = c.child("a:graphic").and_then(|g| self.keep_embedded(g, rels, &extra));
@@ -938,6 +965,34 @@ impl Reader<'_> {
         Some(obj)
     }
 
+    /// Keep the selected native-ink branch and its picture fallback as one object. Reading only
+    /// the fallback flattens the ink; reading only the choice loses its preview on the next save.
+    fn read_ink_alternate(&mut self, sc: &mut StoryCtx, ac: &El, rels: &Rels) -> Option<InlineObject> {
+        let choice = children_of_choice(ac).filter(|e| e.name == "mc:Choice")?;
+        let drawing = choice.child("w:drawing")?;
+        if drawing.find("a:graphicData")?.attr("uri") != Some(INK_URI) {
+            return None;
+        }
+        let fallback = ac.child("mc:Fallback");
+        let preview = fallback.and_then(|f| f.child("w:pict")).and_then(|p| self.read_vml(sc, p, rels));
+        let Some(mut object) = self.read_drawing(sc, drawing, rels) else { return preview };
+        if let InlineObject::Graphic { w, h, graphic, .. } = &mut object {
+            let graphic = Arc::make_mut(graphic);
+            if let Some(InlineObject::Image { media, .. }) = preview {
+                graphic.items = vec![GraphicItem::Image { rect: [0.0, 0.0, *w, *h], media }];
+            }
+            if let Some(fallback) = fallback {
+                let kept =
+                    El { name: "mc:AlternateContent".into(), attrs: Vec::new(), kids: vec![Node::El(choice.clone()), Node::El(fallback.clone())] };
+                if let Some(source) = self.keep_embedded(&kept, rels, &[]) {
+                    graphic.source = Some(source);
+                }
+                // A malformed or over-budget fallback must not discard a valid native part.
+            }
+        }
+        Some(object)
+    }
+
     /// The chart or SmartArt diagram in an `a:graphicData`, as items in points from its top-left
     /// corner. Charts are drawn from their cached data, SmartArt diagrams from the drawing Word
     /// stores beside them. Built once per part and size; once the file's graphic budget is spent,
@@ -946,6 +1001,7 @@ impl Reader<'_> {
         let part = match kind {
             GraphicKind::Chart => gd.child("c:chart").and_then(|c| c.attr("r:id")).and_then(|id| super::part_of(rels, id, rt::CHART)),
             GraphicKind::Diagram => self.diagram_part(gd, rels),
+            GraphicKind::Ink => None,
         };
         let Some(path) = part else { return Arc::new(Graphic { kind, items: Vec::new(), w, h, source, chart: None, smart_art: None }) };
         let key = (kind, path, w.to_bits(), h.to_bits());
@@ -978,6 +1034,7 @@ impl Reader<'_> {
                 None => Vec::new(),
             },
             GraphicKind::Diagram => self.diagram_drawing(path, w, h),
+            GraphicKind::Ink => Vec::new(),
         }
     }
 
@@ -1649,7 +1706,9 @@ struct Xfrm {
 /// The rotation and flips of the `a:xfrm` in shape properties `sppr` (ECMA-376 §20.1.7.6:
 /// `rot` in 60000ths of a degree, clockwise; `flipH`, `flipV`). None when missing or junk.
 fn xfrm_spin(sppr: Option<&El>) -> wordcraft_geom::Spin {
-    let Some(x) = sppr.and_then(|s| s.child("a:xfrm")) else { return wordcraft_geom::Spin::default() };
+    let Some(x) = sppr.and_then(|s| if matches!(s.name.as_str(), "a:xfrm" | "w14:xfrm") { Some(s) } else { s.child("a:xfrm") }) else {
+        return wordcraft_geom::Spin::default();
+    };
     let rot = x.attr("rot").and_then(int).map(|v| v.rem_euclid(21_600_000) as f32 / 60_000.0).unwrap_or(0.0);
     wordcraft_geom::Spin::new(rot, on_off_attr(x, "flipH"), on_off_attr(x, "flipV"))
 }

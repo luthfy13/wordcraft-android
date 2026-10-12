@@ -185,9 +185,17 @@ pub struct UiState {
     /// Read Aloud speed (1 = normal) and whether it skips citations and bibliographies.
     pub read_aloud_rate: f32,
     pub read_aloud_skip_citations: bool,
+    /// Show ribbon and Quick Access Toolbar KeyTips on Alt/F10 (#620).
+    pub keytips_enabled: bool,
+    /// Digits entered for a multi-key Quick Access Toolbar badge; never persisted.
+    #[serde(skip)]
+    pub keytip_prefix: String,
     /// Keytips (Alt) state; not persisted, it resets each session.
     #[serde(skip)]
     pub keytips: crate::keytips::Phase,
+    /// Alt is held according to key or modifier events; never persisted.
+    #[serde(skip)]
+    pub alt_pressed: bool,
     /// Since the last Alt press, another key or a mouse button was pressed: the Alt release
     /// that follows ends a chord (Alt+click, Alt+drag column selection), not a keytip tap.
     #[serde(skip)]
@@ -256,7 +264,10 @@ impl Default for UiState {
             editing: wordcraft_engine::Prefs::default(),
             read_aloud_rate: 1.0,
             read_aloud_skip_citations: true,
+            keytips_enabled: true,
+            keytip_prefix: String::new(),
             keytips: crate::keytips::Phase::Off,
+            alt_pressed: false,
             alt_chord_used: false,
             dark_page: false,
             caret_animation: true,
@@ -786,6 +797,15 @@ impl WordApp {
     fn after_command(&mut self, id: &str) {
         options::sync(self);
         self.canvas.caret_visible_since = now_ms();
+        if id == "view.outline" {
+            self.ui.nav_tab = "headings".into();
+        }
+        if matches!(id, "view.readColumnWidth" | "view.readTextSize" | "view.readLineSpacing") {
+            self.canvas.read_force_reflow = true;
+        }
+        if id == "view.readMode" {
+            self.canvas.read_first_visible = None;
+        }
         if !id.starts_with("view.") && !id.starts_with("document.") && !id.starts_with("format.state") {
             self.canvas.scroll_to_caret = true;
         }
@@ -922,6 +942,17 @@ impl WordApp {
             "ui.collapseRibbon" => {
                 self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
                 json!({"collapsed": self.ui.ribbon_collapsed})
+            }
+            "ui.keytips" => {
+                if let Some(v) = p.get("value") {
+                    let Some(enabled) = v.as_bool() else { return Some(Err("`value` must be a boolean".into())) };
+                    self.ui.keytips_enabled = enabled;
+                    if !enabled {
+                        self.ui.keytips = keytips::Phase::Off;
+                        self.ui.keytip_prefix.clear();
+                    }
+                }
+                json!({"enabled": self.ui.keytips_enabled})
             }
             "ui.dark" => {
                 // A manual Light/Dark switch (toggles what is shown when no value is given).
@@ -1937,6 +1968,138 @@ mod tests {
         let notch = crate::scroll::notch_px(a.canvas.scale / crate::canvas::PX_PER_PT);
         assert!(first > 0.0 && first < notch, "a notch eases in: {first}");
         assert!((a.canvas.scroll_offset.y - at - notch).abs() < 0.5, "a notch scrolls {notch}: {}", a.canvas.scroll_offset.y - at);
+    }
+
+    /// Reading Mode: reflowed viewport-height columns, horizontal wheel/navigation, exit restores
+    /// Print Layout without editing or changing the document's page setup.
+    #[test]
+    fn reading_mode_columns_wheel_turns_and_navigation() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        a.run("text.insert", json!({"text": "One readable paragraph in many narrow columns. ".repeat(300)})).unwrap();
+        a.run("caret.set", json!({"pos": wordcraft_doc::Pos::body(0, 0)})).unwrap();
+        let original = a.session.doc.settings.clone();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 740.0));
+        let mut t = 0.0;
+        let mut frame = |a: &mut WordApp, events: Vec<egui::Event>, screen| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput { events, time: Some(t), screen_rect: Some(screen), ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..3 {
+            frame(&mut a, vec![], screen);
+        }
+        a.run("view.readMode", json!({})).unwrap();
+        for _ in 0..3 {
+            frame(&mut a, vec![], screen);
+        }
+        let rects = &a.canvas.page_rects;
+        assert!(rects.len() > 5, "reading should reflow: {}", rects.len());
+        assert_eq!(a.canvas.cols, rects.len(), "one unwrapped row");
+        assert!((rects[0].top() - rects[1].top()).abs() < 0.1);
+        assert!(rects[1].left() > rects[0].right());
+        assert!((rects[0].height() - (a.canvas.canvas_rect.unwrap().height() - 36.0)).abs() < 2.0);
+        let initial_width = a.session.view.read_width;
+        // A simple mouse click in a later visible column must neither pull that column
+        // to the leading edge nor select text under the stationary, held pointer.
+        let click = a.canvas.page_rects[2].center();
+        assert!(a.canvas.canvas_rect.unwrap().contains(click));
+        let initial_scroll = a.canvas.scroll_offset.x;
+        let button =
+            |pressed| egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut a, vec![egui::Event::PointerMoved(click), button(true)], screen);
+        assert_eq!(a.session.layout().caret_on(&a.session.sel.focus, a.session.page_hint).unwrap().page, 2);
+        frame(&mut a, vec![], screen); // mouse is still held at the same coordinates
+        assert!((a.canvas.scroll_offset.x - initial_scroll).abs() < 0.5, "click must not scroll a later column to the left");
+        assert!(a.session.sel.is_collapsed(), "stationary click must not create a selection");
+        frame(&mut a, vec![button(false)], screen);
+        frame(&mut a, vec![], screen);
+        assert!((a.canvas.scroll_offset.x - initial_scroll).abs() < 0.5);
+        assert!(a.session.sel.is_collapsed());
+        // An explicit caret move outside the visible columns must still reveal its destination.
+        a.run("caret.set", json!({"pos": wordcraft_doc::Pos::body(0, 5000)})).unwrap();
+        frame(&mut a, vec![], screen);
+        assert!(a.canvas.scroll_offset.x > initial_scroll + a.session.view.read_width * a.canvas.scale);
+        a.run("caret.set", json!({"pos": wordcraft_doc::Pos::body(0, 0)})).unwrap();
+        frame(&mut a, vec![], screen);
+        assert!((a.canvas.scroll_offset.x - initial_scroll).abs() < 0.5);
+        let over = a.canvas.canvas_rect.unwrap().center();
+        frame(&mut a, vec![egui::Event::PointerMoved(over)], screen);
+        frame(
+            &mut a,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -65.0),
+                phase: egui::TouchPhase::Start,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            screen,
+        );
+        let step = a.session.view.read_width * a.canvas.scale + 18.0;
+        assert!(a.canvas.scroll_offset.x > 0.0 && a.canvas.scroll_offset.x < step, "a wheel turn animates instead of jumping");
+        let first = a.canvas.scroll_offset.x;
+        frame(&mut a, vec![], screen);
+        assert!(a.canvas.scroll_offset.x > first, "smooth motion continues after the wheel event");
+        for _ in 0..23 {
+            frame(&mut a, vec![], screen);
+        }
+        assert!((a.canvas.scroll_offset.x - step).abs() < 1.0, "animation settles exactly on column boundary");
+        assert_eq!(a.canvas.scroll_offset.y, 0.0);
+        canvas::turn_read_page(&mut a, 1.0);
+        for _ in 0..25 {
+            frame(&mut a, vec![], screen);
+        }
+        assert!((a.canvas.scroll_offset.x - 2.0 * step).abs() < 1.0);
+        let x = a.canvas.scroll_offset.x;
+        // A heading navigation request must position its column at the leading edge,
+        // not wherever egui's generic scroll_to_rect decides the caret is visible.
+        let target = wordcraft_doc::Pos::body(0, 5000);
+        a.run("view.navigationPane", json!({"value": true})).unwrap();
+        a.run("caret.set", json!({"pos": target})).unwrap();
+        a.canvas.nav_to_caret = true;
+        a.canvas.scroll_to_caret = false;
+        frame(&mut a, vec![], screen);
+        let page = a.session.layout().caret_on(&a.session.sel.focus, a.session.page_hint).unwrap().page;
+        let step = a.session.view.read_width * a.canvas.scale + 18.0;
+        assert!((a.canvas.scroll_offset.x - (page as f32 * step)).abs() < 1.0, "heading must align its column beside the navigation pane");
+        assert!(a.canvas.scroll_offset.x != x);
+        // Resizing changes the content width (reflow), not the zoom or the print paper width.
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(850.0, 630.0));
+        let before_resize = a.canvas.scroll_offset.x;
+        let before_layout = a.session.layout();
+        let anchor = a.canvas.read_first_visible.clone().unwrap();
+        frame(&mut a, vec![], narrow);
+        assert!(std::sync::Arc::ptr_eq(&before_layout, &a.session.layout()), "resize frames reuse cached pagination");
+        assert!((a.canvas.scroll_offset.x - before_resize).abs() < 1.0, "no jump while resize is in progress");
+        assert_eq!(a.session.view.read_width, initial_width, "expensive repagination is deferred during resizing");
+        for _ in 0..15 {
+            frame(&mut a, vec![], narrow);
+        }
+        assert_ne!(a.session.view.read_width, initial_width);
+        assert!(!std::sync::Arc::ptr_eq(&before_layout, &a.session.layout()), "stable viewport commits one repagination");
+        let target_page = a.session.layout().caret_on(&anchor, 0).unwrap().page;
+        let new_step = a.session.view.read_width * a.canvas.scale + 18.0;
+        assert!(
+            (a.canvas.scroll_offset.x - target_page as f32 * new_step).abs() < 1.0,
+            "resize must preserve visible text anchor, not jump to editing caret"
+        );
+        assert!((a.canvas.scale - canvas::PX_PER_PT).abs() < 0.01);
+        a.run("view.readColumnWidth", json!({"value": "page"})).unwrap();
+        frame(&mut a, vec![], narrow);
+        assert!(a.session.view.read_width <= 612.0);
+        a.run("view.readTextSize", json!({"value": 125})).unwrap();
+        frame(&mut a, vec![], narrow);
+        assert!((a.canvas.scale / canvas::PX_PER_PT - 1.25).abs() < 0.01);
+        // The Edit Document button works even when the navigation pane owns focus.
+        a.run("view.printLayout", json!({})).unwrap();
+        frame(&mut a, vec![], narrow);
+        assert!(!a.session.view.read_mode);
+        assert_eq!(a.session.view.mode, wordcraft_layout::ViewMode::Print);
+        assert_eq!(a.session.doc.settings, original);
     }
 
     /// An app whose host reports the system's animation setting as `system` holds it.

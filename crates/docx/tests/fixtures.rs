@@ -1513,3 +1513,208 @@ fn vml_lines_and_rectangles() {
     }
     assert!(matches!(&objs[1], InlineObject::Shape { kind: ShapeKind::Rectangle, fill: Some(Rgb(255, 0, 0)), stroke: None, w: 30.0, h: 20.0, .. }));
 }
+
+// ---- native Word ink: opaque preservation, never re-encoded as WordCraft freeforms ----
+
+const INK_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingInk";
+const INK_XML: &str = r##"<ink xmlns="http://www.w3.org/2003/InkML"><definitions><context xml:id="ctx"><inkSource xml:id="src"><traceFormat><channel name="X" type="integer" units="cm"/><channel name="Y" type="integer" units="cm"/></traceFormat></inkSource></context><brush xml:id="blue"><brushProperty name="color" value="#2563EB"/><brushProperty name="width" value="0.08" units="cm"/></brush></definitions><trace contextRef="#ctx" brushRef="#blue">0 0, 1 1, 2 0</trace></ink>"##;
+const INK_TYPES: &str = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/ink/ink1.xml" ContentType="application/inkml+xml"/><Default Extension="png" ContentType="image/png"/></Types>"#;
+
+fn ink_docx(fallback: bool, alias: bool) -> Vec<u8> {
+    let content = r#"<q:contentPart xmlns:q="http://schemas.microsoft.com/office/word/2010/wordml" r:id="rInk"><q:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></q:xfrm></q:contentPart>"#;
+    let drawing = format!(
+        r#"<w:drawing><wp:inline><wp:extent cx="1828800" cy="914400"/><wp:docPr id="1" name="Study ink"/><a:graphic><a:graphicData uri="{INK_NS}">{content}</a:graphicData></a:graphic></wp:inline></w:drawing>"#
+    );
+    let prefix = if alias { "pen" } else { "wpi" };
+    let markup = if fallback {
+        format!(
+            r##"<mc:AlternateContent><mc:Choice xmlns:{prefix}="{INK_NS}" Requires="{prefix}">{drawing}</mc:Choice><mc:Fallback><w:pict><v:shape id="preview" style="width:144pt;height:72pt"><v:imagedata r:id="rPreview"/></v:shape></w:pict></mc:Fallback></mc:AlternateContent>"##
+        )
+    } else {
+        drawing
+    };
+    let body = format!("<w:p><w:r><w:t>Original</w:t></w:r></w:p><w:p><w:r>{markup}</w:r></w:p>");
+    let mut relationships = vec![("rInk", "customXml", "ink/ink1.xml")];
+    let mut extra = vec![("[Content_Types].xml", INK_TYPES), ("word/ink/ink1.xml", INK_XML)];
+    if fallback {
+        relationships.push(("rPreview", "image", "media/preview.png"));
+        extra.push(("word/media/preview.png", "original preview bytes"));
+    }
+    docx(&body, &relationships, &extra)
+}
+
+fn check_ink(files: &std::collections::BTreeMap<String, Vec<u8>>) -> String {
+    let body = text(files, "word/document.xml");
+    let [id] = attr_values(&body, "w14:contentPart", "r:id").try_into().unwrap_or_else(|_| panic!("ink reference lost: {body}"));
+    let (kind, target) = rel(&text(files, "word/_rels/document.xml.rels"), &id);
+    assert!(kind.ends_with("/customXml"));
+    let part = part_at("word", &target);
+    assert_eq!(text(files, &part), INK_XML);
+    assert!(text(files, "[Content_Types].xml").contains(&format!(r#"PartName="/{part}" ContentType="application/inkml+xml""#)));
+    part
+}
+
+#[test]
+fn native_ink_survives_unrelated_edit_and_two_saves() {
+    let mut d = wordcraft_docx::read(&ink_docx(false, false)).unwrap();
+    let g = graphics(&d);
+    assert_eq!(g.len(), 1, "native ink must remain a model object");
+    let InlineObject::Graphic { graphic, .. } = &g[0] else { panic!() };
+    assert_eq!(graphic.kind.noun(), "ink");
+    assert!(graphic.source.is_some());
+    assert!(!graphic.items.is_empty(), "a missing preview must not silently leave a blank frame");
+    let p = std::sync::Arc::make_mut(&mut d.body[0]);
+    let Block::Para(p) = p else { panic!() };
+    p.delete(0, p.len()).unwrap();
+    p.insert_text(0, "Edited", &Default::default()).unwrap();
+    for _ in 0..2 {
+        let out = wordcraft_docx::write(&d).unwrap();
+        let files = unzip(&out);
+        check_ink(&files);
+        assert!(text(&files, "word/document.xml").contains("Edited"));
+        d = wordcraft_docx::read(&out).unwrap();
+        assert_eq!(graphics(&d).len(), 1);
+    }
+}
+
+#[test]
+fn native_ink_keeps_alternate_content_and_preview_with_renamed_prefixes() {
+    for alias in [false, true] {
+        let mut d = wordcraft_docx::read(&ink_docx(true, alias)).unwrap();
+        let g = graphics(&d);
+        assert_eq!(g.len(), 1, "fallback must not replace native ink");
+        let InlineObject::Graphic { graphic, .. } = &g[0] else { panic!() };
+        assert!(
+            graphic.items.iter().any(|item| matches!(item, wordcraft_doc::graphic::GraphicItem::Image { media, .. } if d.media.contains_key(media)))
+        );
+        for _ in 0..2 {
+            let out = wordcraft_docx::write(&d).unwrap();
+            let files = unzip(&out);
+            check_ink(&files);
+            let body = text(&files, "word/document.xml");
+            assert!(body.contains("<mc:AlternateContent>") && body.contains("<mc:Fallback>"));
+            let [id] = attr_values(&body, "v:imagedata", "r:id").try_into().unwrap();
+            let (kind, target) = rel(&text(&files, "word/_rels/document.xml.rels"), &id);
+            assert!(kind.ends_with("/image"));
+            assert_eq!(text(&files, &part_at("word", &target)), "original preview bytes");
+            d = wordcraft_docx::read(&out).unwrap();
+            assert_eq!(graphics(&d).len(), 1);
+        }
+    }
+}
+
+#[test]
+fn native_ink_missing_part_uses_available_fallback() {
+    let bytes = ink_docx(true, true);
+    let mut files = unzip(&bytes);
+    files.remove("word/ink/ink1.xml");
+    let entries: Vec<_> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    let d = wordcraft_docx::read(&zip(&entries)).unwrap();
+    assert!(graphics(&d).is_empty());
+    assert!(paras(&d).iter().flat_map(|p| &p.objects).any(|o| matches!(o, InlineObject::Image { .. })));
+    let files = unzip(&wordcraft_docx::write(&d).unwrap());
+    assert!(!text(&files, "word/document.xml").contains("w14:contentPart"));
+    assert!(files.values().any(|bytes| bytes == b"original preview bytes"));
+}
+
+#[test]
+fn native_ink_missing_optional_preview_keeps_native_part() {
+    let mut files = unzip(&ink_docx(true, false));
+    files.remove("word/media/preview.png");
+    let entries: Vec<_> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    let d = wordcraft_docx::read(&zip(&entries)).unwrap();
+    assert_eq!(graphics(&d).len(), 1);
+    let files = unzip(&wordcraft_docx::write(&d).unwrap());
+    check_ink(&files);
+    assert!(!text(&files, "word/document.xml").contains("<mc:Fallback>"));
+}
+
+#[test]
+fn native_ink_requires_the_bound_namespace_and_ink_content_type() {
+    for wrong_namespace in [true, false] {
+        let mut files = unzip(&ink_docx(true, false));
+        let name = if wrong_namespace { "word/document.xml" } else { "[Content_Types].xml" };
+        let old = text(&files, name);
+        let changed = if wrong_namespace {
+            old.replace(&format!(r#"xmlns:wpi="{INK_NS}""#), r#"xmlns:wpi="urn:future:unsupported""#)
+        } else {
+            old.replace("application/inkml+xml", "application/xml")
+        };
+        files.insert(name.into(), changed.into_bytes());
+        let entries: Vec<_> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+        let d = wordcraft_docx::read(&zip(&entries)).unwrap();
+        assert!(graphics(&d).is_empty());
+        assert!(paras(&d).iter().flat_map(|p| &p.objects).any(|o| matches!(o, InlineObject::Image { .. })));
+    }
+}
+
+#[test]
+fn native_ink_copies_have_independent_parts_and_current_frames() {
+    let mut d = wordcraft_docx::read(&ink_docx(true, false)).unwrap();
+    let [mut object] = graphics(&d).try_into().unwrap();
+    let InlineObject::Graphic { w, h, float, .. } = &mut object else { panic!() };
+    (*w, *h) = (288.0, 144.0);
+    *float = wordcraft_doc::para::Float { wrap: Wrap::Square, h_rel: Anchor::Page, v_rel: Anchor::Page, x: 72.0, y: 36.0, ..Default::default() };
+    let mut p = Paragraph::new();
+    p.insert_object(0, object.clone(), &Default::default()).unwrap();
+    p.insert_object(p.len(), object, &Default::default()).unwrap();
+    d.body = vec![wordcraft_doc::para_block(p)];
+    let out = wordcraft_docx::write(&d).unwrap();
+    let files = unzip(&out);
+    let body = text(&files, "word/document.xml");
+    let ids = attr_values(&body, "w14:contentPart", "r:id");
+    assert_eq!(ids.len(), 2);
+    let parts: Vec<_> = ids.iter().map(|id| part_at("word", &rel(&text(&files, "word/_rels/document.xml.rels"), id).1)).collect();
+    assert_ne!(parts[0], parts[1]);
+    for part in parts {
+        assert_eq!(text(&files, &part), INK_XML);
+    }
+    assert_eq!(attr_values(&body, "wp:extent", "cx"), ["3657600", "3657600"]);
+    assert_eq!(attr_values(&body, "a:ext", "cx"), ["3657600", "3657600"]);
+    assert_eq!(attr_values(&body, "v:shape", "style"), ["width:288pt;height:144pt", "width:288pt;height:144pt"]);
+    assert_eq!(body.matches("<wp:posOffset>914400</wp:posOffset>").count(), 2);
+    let back = wordcraft_docx::read(&out).unwrap();
+    let g = graphics(&back);
+    assert_eq!(g.len(), 2);
+    for object in g {
+        let InlineObject::Graphic { w, h, float, .. } = object else { panic!() };
+        assert_eq!((w, h, float.x, float.y), (288.0, 144.0, 72.0, 36.0));
+    }
+}
+
+#[test]
+fn native_ink_markup_limit_does_not_write_a_dangling_reference() {
+    let mut files = unzip(&ink_docx(false, false));
+    let body = text(&files, "word/document.xml").replace("<a:graphicData ", &format!(r#"<a:graphicData padding="{}" "#, "x".repeat(1024 * 1024 + 1)));
+    files.insert("word/document.xml".into(), body.into_bytes());
+    let entries: Vec<_> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    let d = wordcraft_docx::read(&zip(&entries)).unwrap();
+    let files = unzip(&wordcraft_docx::write(&d).unwrap());
+    assert!(!text(&files, "word/document.xml").contains("w14:contentPart"));
+}
+
+#[test]
+fn native_ink_preserves_inner_transform_and_rotation_padding_on_unrelated_saves() {
+    let mut files = unzip(&ink_docx(false, false));
+    let body = text(&files, "word/document.xml")
+        .replace("<wp:docPr", r#"<wp:effectExtent l="55468" t="512668" r="55468" b="512668"/><wp:docPr"#)
+        .replace("<q:xfrm>", r#"<q:xfrm rot="2700000">"#)
+        .replace(r#"<a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/>"#, r#"<a:off x="127000" y="254000"/><a:ext cx="914400" cy="457200"/>"#);
+    files.insert("word/document.xml".into(), body.into_bytes());
+    let entries: Vec<_> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    let mut d = wordcraft_docx::read(&zip(&entries)).unwrap();
+    for _ in 0..2 {
+        let [object] = graphics(&d).try_into().unwrap();
+        let InlineObject::Graphic { float, .. } = object else { panic!() };
+        assert_eq!(float.spin().deg, 45.0);
+        assert!(float.effect.iter().all(|v| v.abs() < 0.001), "rotation padding is not counted twice: {:?}", float.effect);
+        let out = wordcraft_docx::write(&d).unwrap();
+        let files = unzip(&out);
+        check_ink(&files);
+        let body = text(&files, "word/document.xml");
+        assert_eq!(attr_values(&body, "a:off", "x"), ["127000"]);
+        assert_eq!(attr_values(&body, "a:ext", "cx"), ["914400"]);
+        assert_eq!(attr_values(&body, "w14:xfrm", "rot"), ["2700000"]);
+        d = wordcraft_docx::read(&out).unwrap();
+    }
+}

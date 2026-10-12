@@ -1442,6 +1442,8 @@
 	Border lines	Линије ивица
 	Capitalize first letter of sentences	Велико прво слово реченице
 	Capitalize first letter of table cells	Велико прво слово у ћелијама табеле
+	Correct TWo INitial CApitals	Исправи ДВа ПОчетна велика слова
+	Correct accidental usage of cAPS LOCK key	Исправи случајно укључен cAPS LOCK
 	Capitalize names of days	Велико слово у називима дана
 	Case changes	Промене величине слова
 	Character level	Ниво знака
@@ -1705,6 +1707,7 @@
 	Middle	Средина
 	Click the empty text box the text should continue in (Esc cancels)	Кликните празно поље за текст у ком текст треба да се настави (Esc отказује)
 	Not linked: click a text box	Није повезано: кликните поље за текст
+	Show KeyTips (Alt or F10)	Прикажи савете за тастере (Alt или F10)
 	Location	Локација
 	Endnotes	Ендноте
 	Below text	Испод текста
@@ -1717,6 +1720,10 @@
 	Continuous numbering	Непрекидна нумерација
 	Apply	Примени
 	Convert Notes	Претвори напомене
+	Reading	Читање
+	Reading Column Width	Ширина колоне за читање
+	Reading Line Spacing	Проређеност при читању
+	Reading Text Size	Величина текста за читање
 	English (United Kingdom)	Енглески (Велика Британија)
 	Polish	Пољски
 	Do Not Check Spelling or Grammar	Не проверавај правопис и граматику

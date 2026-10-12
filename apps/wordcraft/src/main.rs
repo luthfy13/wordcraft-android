@@ -123,6 +123,21 @@ fn log_dir() -> Option<std::path::PathBuf> {
     Some(prefs_path()?.parent()?.join("logs"))
 }
 
+/// `custom-dictionary.txt` in the settings folder: the words Add to Dictionary kept (#40).
+fn user_dict_path() -> Option<std::path::PathBuf> {
+    wordcraft_control_key::settings_dir().map(|b| b.join(wordcraft_engine::Session::USER_DICT_FILE))
+}
+
+fn load_user_dictionary(app: &mut WordApp) {
+    if !prefs_enabled() {
+        return;
+    }
+    if let Some(p) = user_dict_path() {
+        wordcraft_proof::load_user_dictionary(&p);
+        app.session.user_dict_path = Some(p);
+    }
+}
+
 /// Runs without preferences (`WORDCRAFT_NO_PREFS`, agents' test runs) neither read nor write them.
 fn prefs_enabled() -> bool {
     std::env::var_os("WORDCRAFT_NO_PREFS").is_none()
@@ -301,6 +316,7 @@ fn main() -> eframe::Result {
             let (file_dialog, dialogs) = file_dialogs::hook(&cc.egui_ctx);
             let mut app = WordApp::new(Session::new(doc), services(file_dialog, &cc.egui_ctx));
             load_prefs(&mut app);
+            load_user_dictionary(&mut app);
             app.watch_desktop_theme(&cc.egui_ctx);
             app.ui.window = restored;
             app.integrated_titlebar = cfg!(target_os = "macos");

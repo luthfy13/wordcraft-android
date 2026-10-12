@@ -1440,6 +1440,8 @@
 	Border lines	边框线
 	Capitalize first letter of sentences	句首字母大写
 	Capitalize first letter of table cells	表格单元格首字母大写
+	Correct TWo INitial CApitals	更正前两个字母连续大写
+	Correct accidental usage of cAPS LOCK key	更正误按 Caps Lock 键造成的大小写错误
 	Capitalize names of days	星期名称首字母大写
 	Case changes	大小写更改
 	Character level	字符级
@@ -1703,6 +1705,7 @@
 	Middle	中部
 	Click the empty text box the text should continue in (Esc cancels)	单击要接续文字的空文本框（按 Esc 取消）
 	Not linked: click a text box	未链接：请单击文本框
+	Show KeyTips (Alt or F10)	显示快捷键提示（Alt 或 F10）
 	Location	位置
 	Endnotes	尾注
 	Below text	文字下方
@@ -1715,6 +1718,10 @@
 	Continuous numbering	连续编号
 	Apply	应用
 	Convert Notes	转换注释
+	Reading	阅读
+	Reading Column Width	阅读栏宽
+	Reading Line Spacing	阅读行距
+	Reading Text Size	阅读字号
 	English (United Kingdom)	英语（英国）
 	Polish	波兰语
 	Do Not Check Spelling or Grammar	不检查拼写和语法

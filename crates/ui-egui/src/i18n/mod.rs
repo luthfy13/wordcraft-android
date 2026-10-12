@@ -52,7 +52,7 @@ pub struct LangInfo {
 }
 
 /// The registry. English first: it is the fallback and the source language.
-pub static LANGUAGES: [LangInfo; 16] = [
+pub static LANGUAGES: [LangInfo; 19] = [
     LangInfo { code: "en", name: "English", source: "", prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // Simplified Chinese; `zh`, `zh-CN`, `zh-SG` and `zh-Hans-*` resolve here (see `candidates`).
     LangInfo {
@@ -85,7 +85,7 @@ pub static LANGUAGES: [LangInfo; 16] = [
         name: "Português (Brasil)",
         source: include_str!("pt-br.tsv"),
         prefer_hans: false,
-        editing_lang: None,
+        editing_lang: Some("pt-BR"),
         catalog: OnceLock::new(),
     },
     // Serbian, Cyrillic script (the default per BCP 47 when no script is given); `sr`, `sr-RS`,
@@ -121,6 +121,14 @@ pub static LANGUAGES: [LangInfo; 16] = [
     LangInfo { code: "tr", name: "Türkçe", source: include_str!("tr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // Italian; `it-IT`, `it-CH` and `it-*` resolve here.
     LangInfo { code: "it", name: "Italiano", source: include_str!("it.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Hungarian; `hu`, `hu-HU` and `hu_HU.UTF-8` resolve here.
+    LangInfo { code: "hu", name: "Magyar", source: include_str!("hu.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // French; `fr`, `fr-FR`, `fr_CA` and other regions resolve here.
+    LangInfo { code: "fr", name: "Français", source: include_str!("fr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Bulgarian; `bg`, `bg-BG` and `bg_BG.UTF-8` resolve here.
+    LangInfo {
+        code: "bg", name: "Български", source: include_str!("bg.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new()
+    },
 ];
 
 impl LangInfo {

@@ -1447,6 +1447,8 @@
 	Border lines	Äärisjooned
 	Capitalize first letter of sentences	Lausete esitäht suureks
 	Capitalize first letter of table cells	Tabelilahtrite esitäht suureks
+	Correct TWo INitial CApitals	Paranda KAks SUurt algustähte
+	Correct accidental usage of cAPS LOCK key	Paranda kogemata sisse jäänud cAPS LOCK
 	Capitalize names of days	Nädalapäevade nimed suure algustähega
 	Case changes	Tähesuuruse muutused
 	Character level	Märgi tasandil
@@ -1671,6 +1673,7 @@
 	Rotate all text 270°	Pööra kogu teksti 270°
 	Rotate all text 90°	Pööra kogu teksti 90°
 	Stacked	Virnas
+	Show KeyTips (Alt or F10)	Näita klahvivihjeid (Alt või F10)
 	Accessibility Pane	Ligipääsetavuse paan
 	Alt Text Pane	Asendusteksti paan
 	Alt\nText	Asendus-\ntekst
@@ -1704,6 +1707,10 @@
 	Continuous numbering	Pidev nummerdus
 	Apply	Rakenda
 	Convert Notes	Teisenda märkused
+	Reading	Lugemine
+	Reading Column Width	Lugemisveeru laius
+	Reading Line Spacing	Lugemise reavahe
+	Reading Text Size	Lugemisteksti suurus
 	Do Not Check Spelling or Grammar	Ära kontrolli õigekirja ega grammatikat
 	English (United Kingdom)	Inglise (Ühendkuningriik)
 	Polish	Poola
