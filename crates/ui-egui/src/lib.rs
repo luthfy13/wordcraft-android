@@ -1115,6 +1115,10 @@ impl WordApp {
                 ));
             }
             "ui.discord" => {
+                // Hidden with the community button (Options), say in a modified build: no link.
+                if !self.ui.show_discord {
+                    return Some(Ok(json!({"hidden": true})));
+                }
                 self.canvas.open_url = Some("https://discord.gg/artcraft".into());
                 json!({})
             }
@@ -3844,6 +3848,17 @@ mod tests {
     /// #311: with System, egui's theme preference stays System, so the native window is never
     /// pinned to a concrete appearance (macOS would stop reporting OS changes), and our palette
     /// follows each OS appearance egui reports.
+    #[test]
+    fn the_community_setting_hides_the_discord_link() {
+        let mut a = app();
+        a.ui.show_discord = false;
+        assert_eq!(a.run("ui.discord", json!({})).unwrap()["hidden"], true);
+        assert!(a.canvas.open_url.is_none(), "no link opens");
+        a.ui.show_discord = true;
+        a.run("ui.discord", json!({})).unwrap();
+        assert_eq!(a.canvas.open_url.as_deref(), Some("https://discord.gg/artcraft"));
+    }
+
     #[test]
     fn system_theme_follows_the_os_without_pinning_the_window() {
         use egui::{SystemTheme, Theme, ThemePreference, ViewportCommand};
