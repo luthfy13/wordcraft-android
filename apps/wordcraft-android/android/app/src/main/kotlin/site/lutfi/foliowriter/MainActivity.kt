@@ -14,6 +14,7 @@ import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
 import android.util.Log
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.PointerIcon
 import android.view.View
@@ -22,6 +23,7 @@ import androidx.activity.result.contract.ActivityResultContract
 import androidx.core.content.IntentCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.androidgamesdk.GameActivity
+import com.google.androidgamesdk.gametextinput.State
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -36,6 +38,8 @@ class MainActivity : GameActivity() {
     private var pendingPersist = false
     private var pendingCreate = NO_REQUEST
     private var pointerType = PointerIcon.TYPE_ARROW
+    /** The last text the native host pushed to the keyboard; its states carry it. UI thread only. */
+    private var imeGeneration = 0L
 
     private val openLauncher = registerForActivityResult(OpenDocument()) { result ->
         val req = pendingPick
@@ -130,6 +134,40 @@ class MainActivity : GameActivity() {
             pendingCreate = NO_REQUEST
             Bridge.pickFailed(req, e)
         }
+    }
+
+    /**
+     * The keyboard's buffer changed (GameTextInput's listener). Sent to the host tagged with the push it
+     * follows; not to GameActivity's native side, whose copy of the text is cut at 64 KiB.
+     */
+    override fun stateChanged(newState: State, dismissed: Boolean) {
+        Bridge.imeState(newState, imeGeneration)
+    }
+
+    /** New text for the keyboard (the document around the caret). The keyboard is told where the selection is first. */
+    internal fun imePush(text: String, anchor: Int, focus: Int, generation: Long) {
+        imeGeneration = generation
+        imeEditorInfo?.let {
+            it.initialSelStart = anchor
+            it.initialSelEnd = focus
+        }
+        setTextInputState(State(text, anchor, focus, -1, -1))
+    }
+
+    /**
+     * Keys from a hardware keyboard go straight to the app, also while the on-screen keyboard's connection
+     * is open (which would otherwise take arrows, Tab, Enter and Backspace, losing Shift and Ctrl). Keys
+     * from on-screen keyboards, and system keys, take the usual way.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val hardware = event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD && event.flags and KeyEvent.FLAG_SOFT_KEYBOARD == 0
+        if (hardware && !event.isSystem) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> return onKeyDown(event.keyCode, event)
+                KeyEvent.ACTION_UP -> return onKeyUp(event.keyCode, event)
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     internal fun setPointer(type: Int) {

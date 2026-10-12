@@ -14,12 +14,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{Axis, InputEvent, KeyAction, KeyEvent, MotionAction, MotionEvent, ToolType};
+use android_activity::input::{Axis, ImeOptions, InputEvent, InputType, KeyAction, KeyEvent, MotionAction, MotionEvent, TextInputAction, ToolType};
 use android_activity::{AndroidApp, AndroidAppWaker, InputStatus, MainEvent, PollEvent};
 use ndk::configuration::UiModeNight;
 use ndk::native_window::NativeWindow;
 
 use crate::host::{Host, Launch, Window};
+use crate::ime;
 use crate::input::{Action, FLAG_NO_FOCUS_CHANGE, KeyPress, Motion, Pointer, Tool};
 use crate::platform::{self, Platform, inbox};
 use crate::store::Dirs;
@@ -147,6 +148,8 @@ struct State {
     upkeep: Option<Instant>,
     /// When frames panicked lately.
     panics: Vec<Instant>,
+    /// The keyboard's settings last sent: for a password field or not.
+    ime_password: Option<bool>,
     /// Debug builds: `--panic-test` panics after the first frames, so CI sees a panic reach logcat.
     #[cfg(debug_assertions)]
     panic_test: bool,
@@ -179,6 +182,7 @@ impl State {
             started: Instant::now(),
             upkeep: None,
             panics: Vec::new(),
+            ime_password: None,
             #[cfg(debug_assertions)]
             panic_test: args.split_whitespace().any(|a| a == "--panic-test"),
             app,
@@ -215,6 +219,9 @@ impl State {
                 self.redraw = false;
                 self.frame();
                 framed = true;
+            }
+            if framed {
+                self.ime_requests();
             }
             let now = Instant::now();
             if framed || self.upkeep.is_some_and(|t| t <= now) {
@@ -431,6 +438,50 @@ impl State {
         self.attach();
     }
 
+    /// The on-screen keyboard: shown and hidden through GameActivity, its text set through the activity
+    /// (which tags the keyboard's states with the push they follow). Never inside `poll_events`.
+    fn ime_requests(&mut self) {
+        for request in self.host.take_ime_requests() {
+            match request {
+                ime::Request::Show => {
+                    self.ime_editor_info();
+                    self.app.show_soft_input(false);
+                }
+                ime::Request::Hide => self.app.hide_soft_input(false),
+                ime::Request::Push { text, anchor, focus, generation } => {
+                    self.ime_editor_info();
+                    let args = serde_json::json!({"text": text, "anchor": anchor, "focus": focus, "generation": generation});
+                    bridge::AndroidPlatform.call("imePush", args);
+                }
+            }
+        }
+    }
+
+    /// A multi-line editor with suggestions and sentence capitals, Enter typing a new line, never
+    /// full-screen; for a password, no suggestions and no learning.
+    fn ime_editor_info(&mut self) {
+        let password = self.host.ime_password();
+        if self.ime_password == Some(password) {
+            return;
+        }
+        self.ime_password = Some(password);
+        let (input_type, options) = if password {
+            (
+                InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_PASSWORD | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING,
+            )
+        } else {
+            (
+                InputType::TYPE_CLASS_TEXT
+                    | InputType::TYPE_TEXT_FLAG_MULTI_LINE
+                    | InputType::TYPE_TEXT_FLAG_CAP_SENTENCES
+                    | InputType::TYPE_TEXT_FLAG_AUTO_CORRECT,
+                ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
+            )
+        };
+        self.app.set_ime_editor_info(input_type, TextInputAction::None, options);
+    }
+
     /// Kotlin's reports (pickers, copies, write-backs, documents sent to the app).
     fn drain_inbox(&mut self) {
         let (reports, dropped) = inbox::take();
@@ -478,7 +529,8 @@ impl State {
                     seen(m.event_time(), m.meta_state().0);
                     self.on_motion(m);
                 }
-                // The soft keyboard's text comes in the next phase.
+                // The keyboard's states come through `MainActivity.stateChanged` (the inbox) instead:
+                // GameTextInput's own copy is cut at 64 KiB.
                 _ => {}
             }
             InputStatus::Handled

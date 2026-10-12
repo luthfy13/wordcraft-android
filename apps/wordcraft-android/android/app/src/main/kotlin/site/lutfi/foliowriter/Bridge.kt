@@ -13,6 +13,7 @@ import android.provider.OpenableColumns
 import android.util.Log
 import androidx.annotation.Keep
 import androidx.core.content.FileProvider
+import com.google.androidgamesdk.gametextinput.State
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -95,6 +96,14 @@ object Bridge {
             "print" -> ok(onUi { it.printPdf(File(a.getString("path")), a.optString("name", LABEL)) })
             "share" -> ok(share(a))
             "moveTaskToBack" -> ok(onUi { it.moveTaskToBack(true) })
+            "imePush" -> {
+                val text = a.getString("text")
+                val anchor = a.getInt("anchor")
+                val focus = a.getInt("focus")
+                val generation = a.getLong("generation")
+                onUi { it.imePush(text, anchor, focus, generation) }
+                null
+            }
             else -> null
         }
     } catch (e: Exception) {
@@ -105,6 +114,20 @@ object Bridge {
     private fun ok(ok: Boolean) = JSONObject().put("ok", ok).toString()
 
     private fun report(event: JSONObject) = nativeEvent(event.toString())
+
+    /** The keyboard's buffer, for the host (`MainActivity.stateChanged`, UI thread). */
+    internal fun imeState(state: State, generation: Long) {
+        report(
+            JSONObject()
+                .put("event", "ime")
+                .put("text", state.text ?: "")
+                .put("selStart", state.selectionStart)
+                .put("selEnd", state.selectionEnd)
+                .put("compStart", state.composingRegionStart)
+                .put("compEnd", state.composingRegionEnd)
+                .put("generation", generation),
+        )
+    }
 
     // Pickers ------------------------------------------------------------------------------------
 

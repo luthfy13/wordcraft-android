@@ -18,8 +18,9 @@ use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
 use crate::files::{FileEvent, FileOp, Files};
-use crate::input::{KeyPress, Motion, Translator};
-use crate::keymap::code;
+use crate::ime::{self, Ime, Target};
+use crate::input::{Action, KeyPress, Motion, TAP_SLOP, Tool, Translator};
+use crate::keymap::{self, code};
 use crate::platform::{self, Inbound, Platform};
 use crate::prompts::Prompts;
 use crate::recovery::Recovery;
@@ -90,6 +91,15 @@ pub struct Host {
     back: Option<BackState>,
     /// Since when quitting waits for write-backs.
     quitting: Option<Instant>,
+    ime: Ime,
+    /// Where a finger or pen went down (px), while it hasn't moved: a tap asks for the keyboard.
+    touch: Option<egui::Pos2>,
+    /// A tap since the last frame (px).
+    tapped: Option<egui::Pos2>,
+    /// The focused text field's text, anchor and caret (`char`s), as egui last reported them.
+    field: Option<(String, usize, usize)>,
+    /// A dialog field wants a password: the keyboard shows no suggestions.
+    password: bool,
     start: Instant,
     window: Option<Window>,
     focused: bool,
@@ -145,6 +155,11 @@ impl Host {
             cursor: None,
             back: None,
             quitting: None,
+            ime: Ime::default(),
+            touch: None,
+            tapped: None,
+            field: None,
+            password: false,
         };
         host.pump();
         host
@@ -170,6 +185,10 @@ impl Host {
 
     /// A report from the platform.
     pub fn event(&mut self, inbound: Inbound) {
+        if let Inbound::Ime { generation, state } = inbound {
+            self.ime_state(generation, state);
+            return;
+        }
         if let Some(files) = &mut self.files {
             match inbound {
                 Inbound::File(event) => files.event(event, &mut self.app),
@@ -178,6 +197,7 @@ impl Host {
                         files.event(FileEvent::Incoming { picked }, &mut self.app);
                     }
                 }
+                Inbound::Ime { .. } => {}
             }
         }
         self.pump();
@@ -265,6 +285,13 @@ impl Host {
         if window.is_none() {
             self.input.reset(&mut self.events);
         }
+        // The keyboard came up over the caret: show it.
+        if let (Some(old), Some(new)) = (self.window, window)
+            && new.height < old.height
+            && self.ime.active()
+        {
+            self.app.canvas.scroll_to_caret = true;
+        }
         self.window = window;
     }
 
@@ -302,7 +329,49 @@ impl Host {
 
     pub fn motion(&mut self, m: &Motion<'_>) {
         let ppp = self.pixels_per_point();
+        let touch = matches!(m.tool, Tool::Finger | Tool::Stylus) && !m.mouse_source;
+        let at = m.pointers.first().map(|p| egui::pos2(p.x, p.y));
+        match m.action {
+            Action::Down | Action::ButtonPress => {
+                // A composition ends where it is before the caret moves.
+                let commit = self.ime.commit();
+                self.events.extend(commit);
+                self.touch = at.filter(|_| touch);
+            }
+            Action::Move => {
+                if let (Some(start), Some(at)) = (self.touch, at)
+                    && (at - start).length() / ppp > TAP_SLOP
+                {
+                    self.touch = None;
+                }
+            }
+            Action::Up => {
+                if let Some(start) = self.touch.take()
+                    && !m.canceled
+                {
+                    self.tapped = Some(start);
+                }
+            }
+            Action::PointerDown | Action::Cancel => self.touch = None,
+            _ => {}
+        }
         self.input.motion(m, ppp, &mut self.events);
+    }
+
+    /// A state from the on-screen keyboard (`generation`: the push it was based on).
+    pub fn ime_state(&mut self, generation: u32, state: ime::Buf) {
+        let events = self.ime.state(generation, state);
+        self.events.extend(events);
+    }
+
+    /// What the on-screen keyboard should do (show, hide, take new text).
+    pub fn take_ime_requests(&mut self) -> Vec<ime::Request> {
+        self.ime.take_requests()
+    }
+
+    /// Whether the keyboard's field is a password (no suggestions, no learning).
+    pub fn ime_password(&self) -> bool {
+        self.password
     }
 
     /// Android 12–13, whose touchpads send a tap-drag without a button (see `input.rs`).
@@ -318,6 +387,11 @@ impl Host {
     pub fn key(&mut self, k: &KeyPress) {
         if k.keycode == code::BACK && k.pressed && self.back.is_none() {
             self.back = Some(BackState::of(&self.app, &self.ctx));
+        }
+        // A key ends the keyboard's composition first, where it is.
+        if k.pressed && !keymap::is_modifier(k.keycode) {
+            let commit = self.ime.commit();
+            self.events.extend(commit);
         }
         let (clipboard, platform) = (&self.clipboard, &self.platform);
         self.input.key(k, || clipboard_text(platform.as_ref(), clipboard), &mut self.events);
@@ -361,6 +435,7 @@ impl Host {
             app.ui(ui);
             prompts.show(ui, app, files.as_mut(), platform);
         });
+        self.after_frame_ime(&out.platform_output);
         for command in out.platform_output.commands {
             match command {
                 OutputCommand::CopyText(text) => {
@@ -394,6 +469,44 @@ impl Host {
         self.pump();
         let primitives = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         Some(Frame { primitives, textures: out.textures_delta, pixels_per_point: out.pixels_per_point })
+    }
+
+    /// Where the keyboard's text goes after this frame, and what's there.
+    fn after_frame_ime(&mut self, output: &egui::PlatformOutput) {
+        for event in &output.events {
+            let info = event.widget_info();
+            if info.typ == egui::WidgetType::TextEdit
+                && let Some(text) = &info.current_text_value
+            {
+                let len = text.chars().count();
+                let (anchor, caret) = info.text_selection.as_ref().map_or((len, len), |r| (r.start.0, r.end.0));
+                self.field = Some((text.clone(), anchor, caret));
+            }
+        }
+        let ppp = self.pixels_per_point();
+        let tap = self.tapped.take().map(|p| egui::pos2(p.x / ppp, p.y / ppp));
+        let (target, fresh, area) = match &output.ime {
+            None => (None, None, None),
+            Some(out) if self.app.canvas.focused => {
+                self.field = None;
+                if self.app.session.math.is_some() {
+                    (Some(Target::Equation), None, self.app.canvas.canvas_rect)
+                } else {
+                    let fresh = ime::Window::of_document(&self.app.session.doc, &self.app.session.sel);
+                    (Some(Target::Document), fresh, self.app.canvas.canvas_rect.or(Some(out.rect)))
+                }
+            }
+            Some(out) => {
+                let fresh = self.field.as_ref().map_or_else(|| ime::Window::of_field("", 0, 0), |(t, a, c)| ime::Window::of_field(t, *a, *c));
+                (Some(Target::Field), Some(fresh), Some(out.rect.expand(8.0)))
+            }
+        };
+        self.password = output.ime.as_ref().is_some_and(|o| o.purpose == egui::IMEPurpose::Password);
+        if target.is_none() {
+            self.field = None;
+        }
+        let tapped = tap.zip(area).is_some_and(|(p, r)| r.contains(p));
+        self.ime.after_frame(target, fresh, tapped);
     }
 
     /// Hands the platform what the documents need (pickers, copies, write-backs) and the app what came of
@@ -541,7 +654,8 @@ fn print(platform: &dyn Platform, dir: &Path, pdf: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{Action, Pointer, Tool};
+    use crate::ime::char_to_utf16;
+    use crate::input::Pointer;
     use crate::keymap::{code, meta};
     use wordcraft_doc::StoryRef;
 
@@ -792,6 +906,59 @@ mod tests {
         press(&mut host, code::A + 18, meta::CTRL_ON);
         assert!(fake.ops("writeBack").iter().any(|w| w["uri"] == "content://x/doc/1"), "{:?}", fake.calls.borrow());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn tap(host: &mut Host, x: f32, y: f32) {
+        let p = [Pointer { id: 0, x, y, pressure: 1.0 }];
+        for action in [Action::Down, Action::Up] {
+            let m = Motion {
+                mouse_source: false,
+                tool: Tool::Finger,
+                device_id: 2,
+                action,
+                index: 0,
+                canceled: false,
+                no_focus_change: false,
+                pointers: &p,
+                buttons: 0,
+                scroll: egui::Vec2::ZERO,
+                meta_state: 0,
+            };
+            host.motion(&m);
+            step(host);
+        }
+    }
+
+    #[test]
+    fn the_on_screen_keyboard_types_into_the_document() {
+        let (mut host, _fake) = android(None);
+        host.take_ime_requests();
+        tap(&mut host, 1280.0, 700.0);
+        step(&mut host);
+        let requests = host.take_ime_requests();
+        assert!(requests.contains(&ime::Request::Show), "{requests:?}");
+        let Some(ime::Request::Push { text, focus, generation, .. }) = requests.iter().find(|r| matches!(r, ime::Request::Push { .. })).cloned()
+        else {
+            panic!("{requests:?}")
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let c = ime::utf16_to_char(&chars, i64::try_from(focus).unwrap());
+        let (before, after): (String, String) = (chars[..c].iter().collect(), chars[c..].iter().collect());
+        let at = |n: usize| i64::try_from(char_to_utf16(&chars, c) + n).unwrap();
+        // Composing "Zeb", then "Zebra " typed.
+        host.ime_state(generation, ime::normalize(&format!("{before}Zeb{after}"), (at(3), at(3)), Some((at(0), at(3)))));
+        step(&mut host);
+        assert_eq!(host.app().canvas.ime_preedit, "Zeb");
+        host.ime_state(generation, ime::normalize(&format!("{before}Zebra {after}"), (at(6), at(6)), None));
+        step(&mut host);
+        assert!(host.app().canvas.ime_preedit.is_empty());
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("Zebra "), "typed into the document");
+        assert!(host.app().session.can_undo());
+        // What the keyboard holds still matches the document: no push.
+        step(&mut host);
+        assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })));
+        // A mouse click elsewhere ends nothing and doesn't bring the keyboard back; hardware typing goes on.
+        press(&mut host, code::A + 25, 0);
     }
 
     #[test]

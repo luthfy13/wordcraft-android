@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use crate::files::{FileEvent, FileOp, Picked, Remote, WriteError};
+use crate::ime;
 
 /// Calls into the platform, made on the `android_main` thread. Kotlin's methods return at once (UI work
 /// is posted to the UI thread; I/O runs on its own thread) and never call back synchronously.
@@ -25,6 +26,11 @@ pub enum Inbound {
     File(FileEvent),
     /// The app was asked to open these (Open with, Share): the documents, copied in by [`FileEvent`]s.
     Incoming(Vec<Picked>),
+    /// The on-screen keyboard's buffer changed; `generation` names the push it was based on.
+    Ime {
+        generation: u32,
+        state: ime::Buf,
+    },
 }
 
 /// The call for a file operation.
@@ -153,6 +159,14 @@ pub fn parse(json: &str) -> Option<Inbound> {
                 None => Ok(None),
             },
         },
+        "ime" => {
+            let int = |k: &str| v.get(k).and_then(Value::as_i64);
+            let text = v.get("text")?.as_str()?;
+            let compose = int("compStart").zip(int("compEnd")).filter(|(a, b)| *a >= 0 && *b >= 0);
+            let state = ime::normalize(text, (int("selStart")?, int("selEnd")?), compose);
+            let generation = u32::try_from(v.get("generation")?.as_u64()?).ok()?;
+            return Some(Inbound::Ime { generation, state });
+        }
         "incoming" => {
             let docs: Vec<Picked> = v.get("documents")?.as_array()?.iter().filter_map(picked).take(16).collect();
             return Some(Inbound::Incoming(docs));
@@ -247,6 +261,9 @@ mod tests {
         assert_eq!(parse(r#"{"event":"refreshed","entry":2}"#), Some(Inbound::File(FileEvent::Refreshed { entry: 2, result: Ok(None) })));
         let Some(Inbound::Incoming(docs)) = parse(r#"{"event":"incoming","documents":[{"uri":"content://a"},{"name":"no uri"}]}"#) else { panic!() };
         assert_eq!(docs.len(), 1);
+        let ime = parse(r#"{"event":"ime","text":"a😀b","selStart":3,"selEnd":3,"compStart":-1,"compEnd":-1,"generation":4}"#);
+        let Some(Inbound::Ime { generation: 4, state }) = ime else { panic!("{ime:?}") };
+        assert_eq!((state.focus, state.compose), (2, None));
     }
 
     #[test]

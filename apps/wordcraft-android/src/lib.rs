@@ -11,6 +11,7 @@
 mod crash;
 mod files;
 mod host;
+mod ime;
 mod input;
 mod keymap;
 mod platform;
