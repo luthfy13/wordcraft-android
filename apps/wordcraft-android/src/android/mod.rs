@@ -153,8 +153,8 @@ struct State {
     upkeep: Option<Instant>,
     /// When frames panicked lately.
     panics: Vec<Instant>,
-    /// The keyboard's settings last sent: for a password field or not.
-    ime_password: Option<bool>,
+    /// The keyboard's settings last sent.
+    ime_editor: Option<ime::Editor>,
     /// Debug builds: `--panic-test` panics after the first frames, so CI sees a panic reach logcat.
     #[cfg(debug_assertions)]
     panic_test: bool,
@@ -187,7 +187,7 @@ impl State {
             started: Instant::now(),
             upkeep: None,
             panics: Vec::new(),
-            ime_password: None,
+            ime_editor: None,
             #[cfg(debug_assertions)]
             panic_test: args.split_whitespace().any(|a| a == "--panic-test"),
             app,
@@ -209,8 +209,9 @@ impl State {
             let app = self.app.clone();
             app.poll_events(self.timeout(), |event| self.on_event(event));
             // Without draining every time, no further input arrives.
-            self.drain_input();
+            // The keyboard's states before keys and taps, which commit a composition the states describe.
             self.drain_inbox();
+            self.drain_input();
             if self.quit {
                 break;
             }
@@ -469,26 +470,31 @@ impl State {
     }
 
     /// A multi-line editor with suggestions and sentence capitals, Enter typing a new line, never
-    /// full-screen; for a password, no suggestions and no learning.
+    /// full-screen; for a password, no suggestions and no learning; for an equation, no capitals and no
+    /// corrections.
     fn ime_editor_info(&mut self) {
-        let password = self.host.ime_password();
-        if self.ime_password == Some(password) {
+        let editor = self.host.ime_editor();
+        if self.ime_editor == Some(editor) {
             return;
         }
-        self.ime_password = Some(password);
-        let (input_type, options) = if password {
-            (
+        self.ime_editor = Some(editor);
+        let fixed = ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI;
+        let (input_type, options) = match editor {
+            ime::Editor::Password => (
                 InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_PASSWORD | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
-                ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING,
-            )
-        } else {
-            (
+                fixed | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING,
+            ),
+            ime::Editor::Raw => (
+                InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                fixed | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
+            ),
+            ime::Editor::Text => (
                 InputType::TYPE_CLASS_TEXT
                     | InputType::TYPE_TEXT_FLAG_MULTI_LINE
                     | InputType::TYPE_TEXT_FLAG_CAP_SENTENCES
                     | InputType::TYPE_TEXT_FLAG_AUTO_CORRECT,
-                ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IMG_FLAG_NO_EXTRACT_UI | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
-            )
+                fixed | ImeOptions::IME_FLAG_NO_ENTER_ACTION,
+            ),
         };
         self.app.set_ime_editor_info(input_type, TextInputAction::None, options);
     }
@@ -540,6 +546,7 @@ impl State {
                     seen(m.event_time(), m.meta_state().0);
                     self.on_motion(m);
                 }
+                InputEvent::TextAction(_) if live => self.host.ime_action(),
                 // The keyboard's states come through `MainActivity.stateChanged` (the inbox) instead:
                 // GameTextInput's own copy is cut at 64 KiB.
                 _ => {}

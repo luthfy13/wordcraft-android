@@ -5,6 +5,7 @@
 //! or the GPU, so tests drive it on the host.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -29,6 +30,8 @@ use crate::store::{self, Dirs};
 
 /// How long quitting waits for documents to be written back before giving up.
 const QUIT_WAIT: Duration = Duration::from_secs(15);
+/// Keyboard states waiting beyond this are applied together.
+const IME_BACKLOG: usize = 64;
 
 /// What to open at start-up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -100,10 +103,13 @@ pub struct Host {
     touch: Option<egui::Pos2>,
     /// A tap since the last frame (px).
     tapped: Option<egui::Pos2>,
-    /// The focused text field's text, anchor and caret (`char`s), as egui last reported them.
-    field: Option<(String, usize, usize)>,
+    /// The focused text field's text, as egui last reported it.
+    field: Option<String>,
     /// A dialog field wants a password: the keyboard shows no suggestions.
     password: bool,
+    /// The keyboard's states not applied yet: one a frame, so each applies to the document the one
+    /// before left.
+    ime_states: VecDeque<(u32, ime::Buf)>,
     start: Instant,
     window: Option<Window>,
     focused: bool,
@@ -170,6 +176,7 @@ impl Host {
             tapped: None,
             field: None,
             password: false,
+            ime_states: VecDeque::new(),
         };
         host.pump();
         host
@@ -367,8 +374,46 @@ impl Host {
 
     /// A state from the on-screen keyboard (`generation`: the push it was based on).
     pub fn ime_state(&mut self, generation: u32, state: ime::Buf) {
-        let events = self.ime.state(generation, state);
+        self.ime_states.push_back((generation, state));
+    }
+
+    /// The keyboard's action key (Done, Go…).
+    pub fn ime_action(&mut self) {
+        let events = self.ime.action();
         self.events.extend(events);
+    }
+
+    /// Applies the keyboard's states until one changes something; the rest wait for the next frame
+    /// (unless they pile up: then all of them, rather than fall behind).
+    fn next_ime_states(&mut self) {
+        let backlog = self.ime_states.len() > IME_BACKLOG;
+        while let Some((generation, state)) = self.ime_states.pop_front() {
+            let events = self.ime.state(generation, state);
+            let changed = !events.is_empty() || self.ime.select_pending();
+            self.events.extend(events);
+            if changed && !backlog {
+                break;
+            }
+            if backlog {
+                // Its place is lost among the edits: the next push shows the keyboard where the caret is.
+                let _ = self.ime.take_select();
+            }
+        }
+    }
+
+    /// Sets the document's selection where the keyboard put it, now that the edits before it are in.
+    fn apply_ime_select(&mut self) {
+        let Some((anchor, focus)) = self.ime.take_select() else { return };
+        if !self.app.canvas.focused {
+            return;
+        }
+        let session = &mut self.app.session;
+        let from = session.sel.focus.clone();
+        if let (Some(anchor), Some(focus)) = (ime::walk(&session.doc, &from, anchor), ime::walk(&session.doc, &from, focus))
+            && let Err(e) = session.run("select.range", &json!({"anchor": anchor, "focus": focus}))
+        {
+            log::warn!("the keyboard's selection: {e}");
+        }
     }
 
     /// What the on-screen keyboard should do (show, hide, take new text).
@@ -376,9 +421,9 @@ impl Host {
         self.ime.take_requests()
     }
 
-    /// Whether the keyboard's field is a password (no suggestions, no learning).
-    pub fn ime_password(&self) -> bool {
-        self.password
+    /// The editor the keyboard should be set up as.
+    pub fn ime_editor(&self) -> ime::Editor {
+        self.ime.editor(self.password)
     }
 
     /// Android 12–13, whose touchpads send a tap-drag without a button (see `input.rs`).
@@ -406,12 +451,13 @@ impl Host {
 
     /// Whether input is waiting for a frame.
     pub fn has_events(&self) -> bool {
-        !self.events.is_empty()
+        !self.events.is_empty() || !self.ime_states.is_empty()
     }
 
     /// Runs one frame, or `None` without a window.
     pub fn frame(&mut self) -> Option<Frame> {
         let window = self.window?;
+        self.next_ime_states();
         let native = window.native_ppp();
         let ppp = self.pixels_per_point();
         let [left, top, right, bottom] = window.insets.map(|i| i as f32 / ppp);
@@ -445,6 +491,7 @@ impl Host {
             about.show(&ctx);
             prompts.show(ui, app, files.as_mut(), platform);
         });
+        self.apply_ime_select();
         self.after_frame_ime(&out.platform_output);
         for command in out.platform_output.commands {
             match command {
@@ -503,9 +550,7 @@ impl Host {
             if info.typ == egui::WidgetType::TextEdit
                 && let Some(text) = &info.current_text_value
             {
-                let len = text.chars().count();
-                let (anchor, caret) = info.text_selection.as_ref().map_or((len, len), |r| (r.start.0, r.end.0));
-                self.field = Some((text.clone(), anchor, caret));
+                self.field = Some(text.clone());
             }
         }
         let ppp = self.pixels_per_point();
@@ -522,8 +567,13 @@ impl Host {
                 }
             }
             Some(out) => {
-                let fresh = self.field.as_ref().map_or_else(|| ime::Window::of_field("", 0, 0), |(t, a, c)| ime::Window::of_field(t, *a, *c));
-                (Some(Target::Field), Some(fresh), Some(out.rect.expand(8.0)))
+                // The caret as the field keeps it (a tap moves it without telling anyone).
+                let text = self.field.as_deref().unwrap_or("");
+                let len = text.chars().count();
+                let cursor =
+                    self.ctx.memory(|m| m.focused()).and_then(|id| egui::TextEdit::load_state(&self.ctx, id)).and_then(|s| s.cursor.char_range());
+                let (anchor, caret) = cursor.map_or((len, len), |r| (r.secondary.index.0, r.primary.index.0));
+                (Some(Target::Field), Some(ime::Window::of_field(text, anchor, caret)), Some(out.rect.expand(8.0)))
             }
         };
         self.password = output.ime.as_ref().is_some_and(|o| o.purpose == egui::IMEPurpose::Password);
@@ -532,6 +582,9 @@ impl Host {
         }
         let tapped = tap.zip(area).is_some_and(|(p, r)| r.contains(p));
         self.ime.after_frame(target, fresh, tapped);
+        // A composition typed before a push replaced it.
+        let typed = self.ime.take_events();
+        self.events.extend(typed);
     }
 
     /// Hands the platform what the documents need (pickers, copies, write-backs) and the app what came of
@@ -1020,6 +1073,14 @@ mod tests {
         // What the keyboard holds still matches the document: no push.
         step(&mut host);
         assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })));
+        // The keyboard moves the caret back over the word and types: both reports arrive before a frame,
+        // and the letter still goes where the caret went.
+        host.ime_state(generation, ime::normalize(&format!("{before}Zebra {after}"), (at(0), at(0)), None));
+        host.ime_state(generation, ime::normalize(&format!("{before}QZebra {after}"), (at(1), at(1)), None));
+        step(&mut host);
+        step(&mut host);
+        assert!(host.app().session.doc.plain_text(StoryRef::Body).contains("QZebra "), "{}", host.app().session.doc.plain_text(StoryRef::Body));
+        assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })), "still in step");
         // A mouse click elsewhere ends nothing and doesn't bring the keyboard back; hardware typing goes on.
         press(&mut host, code::A + 25, 0);
     }

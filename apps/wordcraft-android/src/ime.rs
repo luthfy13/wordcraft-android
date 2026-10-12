@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 
 use egui::{Event, ImeEvent, Key, Modifiers};
-use wordcraft_doc::{Document, cluster};
+use wordcraft_doc::{Document, Pos, cluster};
 use wordcraft_engine::Selection;
 
 /// Text shown to the IME before and after the caret, in UTF-16 units (LatinIME caches 1024 before).
@@ -115,6 +115,9 @@ impl Plan {
 pub struct Shadow {
     buf: Buf,
     in_doc: Vec<bool>,
+    /// The pushed text reached the start (`.0`) or end (`.1`) of where the caret is (story, cell, field):
+    /// there's nothing more on that side.
+    edges: (bool, bool),
 }
 
 struct View {
@@ -141,7 +144,7 @@ impl Shadow {
     pub fn pushed(mut buf: Buf) -> Self {
         buf.compose = None;
         let in_doc = vec![true; buf.text.len()];
-        Self { buf, in_doc }
+        Self { buf, in_doc, edges: (false, false) }
     }
 
     pub fn preedit_active(&self) -> bool {
@@ -169,8 +172,13 @@ impl Shadow {
     pub fn apply(&mut self, new: Buf) -> Plan {
         let old = &self.buf;
         let (lo, ln) = (old.text.len(), new.text.len());
-        let p = common_prefix(&old.text, &new.text);
-        let q = common_suffix(old.text.get(p..).unwrap_or(&[]), new.text.get(p..).unwrap_or(&[]));
+        // The change is at the caret: a letter typed next to the same letter is the new one, not the old.
+        let (old_lo, old_hi) = (old.anchor.min(old.focus), old.anchor.max(old.focus));
+        let (new_lo, new_hi) = (new.anchor.min(new.focus), new.anchor.max(new.focus));
+        let p = common_prefix(&old.text, &new.text).min(old_lo).min(new_lo);
+        let q = common_suffix(old.text.get(p..).unwrap_or(&[]), new.text.get(p..).unwrap_or(&[]))
+            .min(lo.saturating_sub(old_hi))
+            .min(ln.saturating_sub(new_hi));
         let in_comp = |i: usize| new.compose.is_some_and(|(s, e)| s <= i && i < e);
         // Unchanged characters keep their flag; changed ones are composition inside the composing region
         // and typed outside it.
@@ -248,11 +256,22 @@ impl Shadow {
 
     /// Whether a fresh window (text before and after the caret, anchor relative to it) agrees with what
     /// the IME holds. Windows cut at other lengths agree on their overlap, so typing never forces a push.
+    /// A side that reached an edge must match exactly: an empty side agrees with everything otherwise.
     pub fn consistent(&self, fresh: &Window) -> bool {
         let v = Self::view(&self.buf, &self.in_doc);
         let (b, a) = v.doc.split_at(v.caret.min(v.doc.len()));
-        let before_ok = b.ends_with(&fresh.before) || fresh.before.ends_with(b);
-        let after_ok = a.starts_with(&fresh.after) || fresh.after.starts_with(a);
+        let before_ok = match (fresh.edges.0, self.edges.0) {
+            (true, true) => b == fresh.before.as_slice(),
+            (true, false) => fresh.before.ends_with(b),
+            (false, true) => b.ends_with(&fresh.before),
+            (false, false) => b.ends_with(&fresh.before) || fresh.before.ends_with(b),
+        };
+        let after_ok = match (fresh.edges.1, self.edges.1) {
+            (true, true) => a == fresh.after.as_slice(),
+            (true, false) => fresh.after.starts_with(a),
+            (false, true) => a.starts_with(&fresh.after),
+            (false, false) => a.starts_with(&fresh.after) || fresh.after.starts_with(a),
+        };
         let anchor_ok = !v.preedit.is_empty() || signed(v.anchor) - signed(v.caret) == fresh.anchor;
         before_ok && after_ok && anchor_ok
     }
@@ -270,8 +289,11 @@ impl Shadow {
 pub struct Window {
     pub before: Vec<char>,
     pub after: Vec<char>,
-    /// The anchor relative to the caret, in `char`s (0: no selection, or one the window can't show).
+    /// The anchor relative to the caret, in `char`s: 0 or less (0: no selection, a selection the window
+    /// can't show, or one ending before the caret, which the keyboard's editor mishandles).
     pub anchor: isize,
+    /// Whether `before` reaches the start, and `after` the end, of where the caret is.
+    pub edges: (bool, bool),
 }
 
 /// The end of `text` within `budget` UTF-16 units; whether all of it fit.
@@ -321,21 +343,31 @@ impl Window {
         let para = doc.para(focus.story, &focus.path)?;
         let off = floor(&para.text, focus.off);
         let (mut before, whole_start) = tail(para.text.get(..off)?, BEFORE);
-        if whole_start
-            && let Some(i) = focus.path.last().checked_sub(1)
-            && let Some(prev) = doc.para(focus.story, &focus.path.with_last(i))
-        {
+        let prev = focus.path.last().checked_sub(1).and_then(|i| doc.para(focus.story, &focus.path.with_last(i)));
+        let mut start_edge = false;
+        if whole_start {
             let budget = BEFORE.saturating_sub(utf16_len(&before)).saturating_sub(1);
-            let (mut text, _) = tail(&prev.text, budget);
+            // Nothing before this paragraph (a story's or cell's first, or after a table): a line break
+            // stands for its start, so a Backspace there reaches the app (it may take away a number or an
+            // indent); a keyboard with nothing before the caret sends none.
+            let mut text = prev.map_or_else(Vec::new, |p| tail(&p.text, budget).0);
+            start_edge = prev.is_none();
             text.push('\n');
             text.extend(before);
             before = text;
         }
         let (mut after, whole_end) = head(para.text.get(off..)?, AFTER);
-        if whole_end && let Some(next) = doc.para(focus.story, &focus.path.with_last(focus.path.last().saturating_add(1))) {
-            let budget = AFTER.saturating_sub(utf16_len(&after)).saturating_sub(1);
-            after.push('\n');
-            after.extend(head(&next.text, budget).0);
+        let next = doc.para(focus.story, &focus.path.with_last(focus.path.last().saturating_add(1)));
+        let mut end_edge = false;
+        if whole_end {
+            match next {
+                Some(next) => {
+                    let budget = AFTER.saturating_sub(utf16_len(&after)).saturating_sub(1);
+                    after.push('\n');
+                    after.extend(head(&next.text, budget).0);
+                }
+                None => end_edge = true,
+            }
         }
         // A selection within the paragraph and the window; otherwise the IME sees a caret.
         let anchor = &sel.anchor;
@@ -343,13 +375,12 @@ impl Window {
         if anchor.story == focus.story && anchor.path == focus.path {
             let a = floor(&para.text, anchor.off);
             let between = |x: usize, y: usize| para.text.get(x..y).map_or(0, |t| t.chars().count());
-            rel = if a < off { -signed(between(a, off)) } else { signed(between(off, a)) };
-            let inside = if rel < 0 { rel.unsigned_abs() <= before.len() } else { rel.unsigned_abs() <= after.len() };
-            if !inside {
+            rel = if a < off { -signed(between(a, off)) } else { 0 };
+            if rel.unsigned_abs() > before.len() {
                 rel = 0;
             }
         }
-        Some(Self { before, after, anchor: rel })
+        Some(Self { before, after, anchor: rel, edges: (start_edge, end_edge) })
     }
 
     /// A dialog's text field, as egui reports it (`caret` and `anchor` in `char`s).
@@ -360,18 +391,18 @@ impl Window {
         let (b, a) = chars.split_at(caret);
         let before: String = b.iter().collect();
         let after: String = a.iter().collect();
-        let (before, _) = tail(&before, BEFORE);
-        let (after, _) = head(&after, AFTER);
+        let (before, start) = tail(&before, BEFORE);
+        let (after, end) = head(&after, AFTER);
         let mut rel = signed(anchor) - signed(caret);
-        if rel < -signed(before.len()) || rel > signed(after.len()) {
+        if rel < -signed(before.len()) || rel > 0 {
             rel = 0;
         }
-        Self { before, after, anchor: rel }
+        Self { before, after, anchor: rel, edges: (start, end) }
     }
 
     /// An equation's buffer: spaces to delete.
     pub fn sentinel() -> Self {
-        Self { before: vec![' '; SENTINEL], after: Vec::new(), anchor: 0 }
+        Self { before: vec![' '; SENTINEL], after: Vec::new(), anchor: 0, edges: (true, true) }
     }
 
     pub fn buf(&self) -> Buf {
@@ -381,6 +412,35 @@ impl Window {
         let anchor = usize::try_from(signed(focus).saturating_add(self.anchor)).unwrap_or(focus).min(text.len());
         Buf { text, anchor, focus, compose: None }
     }
+}
+
+/// `from` moved by `n` characters (back when negative), a paragraph break counting as one, as far as the
+/// paragraphs of the same story and container go: where a keyboard's selection lands.
+pub fn walk(doc: &Document, from: &Pos, n: isize) -> Option<Pos> {
+    let mut pos = from.clone();
+    let mut para = doc.para(pos.story, &pos.path)?;
+    let mut off = floor(&para.text, pos.off);
+    for _ in 0..n.unsigned_abs().min(BEFORE + AFTER) {
+        if n < 0 {
+            if let Some(c) = para.text.get(..off).and_then(|t| t.chars().next_back()) {
+                off -= c.len_utf8();
+                continue;
+            }
+            let Some(prev) = pos.path.last().checked_sub(1).map(|i| pos.path.with_last(i)) else { break };
+            let Some(p) = doc.para(pos.story, &prev) else { break };
+            (pos.path, para, off) = (prev, p, p.text.len());
+        } else {
+            if let Some(c) = para.text.get(off..).and_then(|t| t.chars().next()) {
+                off += c.len_utf8();
+                continue;
+            }
+            let next = pos.path.with_last(pos.path.last().saturating_add(1));
+            let Some(p) = doc.para(pos.story, &next) else { break };
+            (pos.path, para, off) = (next, p, 0);
+        }
+    }
+    pos.off = off;
+    Some(pos)
 }
 
 /// Where the keyboard's text goes.
@@ -419,6 +479,22 @@ pub struct Ime {
     /// A push is due whatever the comparison says.
     force: bool,
     requests: Vec<Request>,
+    /// Events for the next frame that didn't come from a state (a composition typed before a push).
+    pending: Vec<Event>,
+    /// Where the keyboard moved the selection (anchor and focus in `char`s from the caret), to apply once
+    /// the edits before it are in the document.
+    select: Option<(isize, isize)>,
+}
+
+/// The kind of editor the keyboard is set up for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Editor {
+    /// Prose: suggestions, sentence capitals, Enter types a new line.
+    Text,
+    /// No suggestions, no learning.
+    Password,
+    /// Equations: no capitals, no corrections.
+    Raw,
 }
 
 impl Ime {
@@ -442,16 +518,58 @@ impl Ime {
         let mut plan = shadow.apply(new);
         if generation != current {
             // The activity is about to replace this buffer with a newer push: what was composed on it is
-            // typed now, or the push would drop it.
+            // typed now, or the push would drop it. A state that changed nothing (the echo of a push) needs
+            // no push of its own: that would echo again, for ever.
+            let mut changed = !plan.is_empty();
             if shadow.preedit_active() {
                 let commit = shadow.commit_preedit();
                 plan.preedit = None;
                 plan.clear_preedit = plan.clear_preedit || commit.clear_preedit;
                 plan.insert.push_str(&commit.insert);
+                changed = true;
             }
-            self.force = true;
+            if changed {
+                self.force = true;
+            }
         }
-        events(&plan, target)
+        self.events(&plan, target)
+    }
+
+    /// The keyboard's action key (Done, Go, Next…): Enter in a dialog's field; nothing in the document,
+    /// whose Enter types a new line instead.
+    pub fn action(&self) -> Vec<Event> {
+        if self.target == Some(Target::Field) { key(Key::Enter, Modifiers::NONE).to_vec() } else { Vec::new() }
+    }
+
+    /// The editor the keyboard should be set up as, for the current target.
+    pub fn editor(&self, password: bool) -> Editor {
+        match self.target {
+            Some(Target::Equation) => Editor::Raw,
+            Some(Target::Field) if password => Editor::Password,
+            _ => Editor::Text,
+        }
+    }
+
+    /// Events that didn't come from a state, for the next frame.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Where the keyboard moved the document's selection, relative to the caret.
+    pub fn take_select(&mut self) -> Option<(isize, isize)> {
+        self.select.take()
+    }
+
+    pub fn select_pending(&self) -> bool {
+        self.select.is_some()
+    }
+
+    fn events(&mut self, plan: &Plan, target: Target) -> Vec<Event> {
+        let (out, select) = events(plan, target);
+        if select.is_some() {
+            self.select = select;
+        }
+        out
     }
 
     /// A key or a tap: an open composition is typed where it is first.
@@ -463,7 +581,7 @@ impl Ime {
         }
         let plan = shadow.commit_preedit();
         self.force = true;
-        events(&plan, target)
+        self.events(&plan, target)
     }
 
     /// After each frame: where the keyboard's text would go, the text there, and whether a touch asked for
@@ -480,6 +598,9 @@ impl Ime {
         };
         self.idle = 0;
         if self.target != Some(target) {
+            // The old buffer belonged elsewhere: its states (and a composition, which a tap or key already
+            // typed) mean nothing here.
+            self.history.clear();
             self.target = Some(target);
             self.force = true;
         }
@@ -492,27 +613,30 @@ impl Ime {
         if !self.active {
             return;
         }
-        let fresh = match target {
+        let push = match target {
+            // Spaces to delete: filled again only when they run low or much was typed after them.
             Target::Equation => {
-                let low = self.history.back().is_none_or(|(_, s)| s.buf.text.len() < SENTINEL / 2 || s.buf.focus != s.buf.text.len());
-                if low {
-                    self.force = true;
-                }
-                Some(Window::sentinel())
+                let low = self.history.back().is_none_or(|(_, s)| {
+                    let spaces = s.buf.text.iter().take(s.buf.focus).take_while(|c| **c == ' ').count();
+                    spaces < SENTINEL / 2 || s.buf.text.len() > 8 * SENTINEL
+                });
+                (self.force || low).then(Window::sentinel)
             }
-            _ => fresh,
-        };
-        let Some(fresh) = fresh else { return };
-        let push = match self.history.back() {
-            None => true,
-            Some(_) if self.force => true,
-            Some((_, s)) => {
-                let len = s.len_utf16();
-                (!s.preedit_active() && (!s.consistent(&fresh) || len > SOFT)) || len > HARD
+            _ => {
+                let Some(fresh) = fresh else { return };
+                let due = match self.history.back() {
+                    None => true,
+                    Some(_) if self.force => true,
+                    Some((_, s)) => {
+                        let len = s.len_utf16();
+                        (!s.preedit_active() && (!s.consistent(&fresh) || len > SOFT)) || len > HARD
+                    }
+                };
+                due.then_some(fresh)
             }
         };
-        if push {
-            self.push(fresh.buf());
+        if let Some(window) = push {
+            self.push(&window);
         }
         if tapped {
             // The keyboard may have been dismissed while the connection stayed: ask again on every tap.
@@ -520,12 +644,24 @@ impl Ime {
         }
     }
 
-    fn push(&mut self, buf: Buf) {
+    fn push(&mut self, window: &Window) {
+        // The push replaces the keyboard's buffer: a composition in it is typed first, not lost.
+        if let Some(target) = self.target
+            && let Some(shadow) = self.current()
+            && shadow.preedit_active()
+        {
+            let plan = shadow.commit_preedit();
+            let events = self.events(&plan, target);
+            self.pending.extend(events);
+        }
         self.force = false;
         self.generation = self.generation.wrapping_add(1);
+        let buf = window.buf();
         let (anchor, focus) = (char_to_utf16(&buf.text, buf.anchor), char_to_utf16(&buf.text, buf.focus));
         self.requests.push(Request::Push { text: buf.text.iter().collect(), anchor, focus, generation: self.generation });
-        self.history.push_back((self.generation, Shadow::pushed(buf)));
+        let mut shadow = Shadow::pushed(buf);
+        shadow.edges = window.edges;
+        self.history.push_back((self.generation, shadow));
         while self.history.len() > HISTORY {
             self.history.pop_front();
         }
@@ -573,11 +709,13 @@ fn deletes(after: &str, chars: usize) -> usize {
     n
 }
 
-/// A plan as the events a keyboard would send.
-fn events(plan: &Plan, target: Target) -> Vec<Event> {
+/// A plan as the events a keyboard would send, and a selection to set afterwards (the document's: arrow
+/// keys move by clusters and visually, the keyboard by characters).
+fn events(plan: &Plan, target: Target) -> (Vec<Event>, Option<(isize, isize)>) {
     let mut out = Vec::new();
+    let mut select = None;
     if plan.is_empty() {
-        return out;
+        return (out, select);
     }
     if plan.clear_preedit {
         out.push(Event::Ime(ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
@@ -605,19 +743,52 @@ fn events(plan: &Plan, target: Target) -> Vec<Event> {
     }
     typed(&plan.insert, &mut out);
     if let Some((anchor, focus)) = plan.select {
-        caret_moves(anchor, focus, &mut out);
+        if target == Target::Document {
+            select = Some((anchor, focus));
+        } else {
+            caret_moves(anchor, focus, &mut out);
+        }
     }
     if let Some(p) = &plan.preedit {
         let n = p.chars().count();
         out.push(Event::Ime(ImeEvent::Preedit { text: p.clone(), active_range_chars: (n > 0).then_some(n..n) }));
     }
-    out
+    (out, select)
 }
+
+/// Text longer than this (a paste from the keyboard's clipboard, dictation) is inserted a line at a time,
+/// not as typing.
+const TYPED: usize = 32;
 
 /// Typed text: runs of ordinary characters together; spaces, punctuation and quotes one at a time (what
 /// AutoCorrect, AutoFormat and smart quotes look at); line breaks as Enter, tabs as Tab; other control
-/// characters dropped.
+/// characters dropped. Long text goes in a line at a time, its last character on its own.
 fn typed(text: &str, out: &mut Vec<Event>) {
+    let text = &text.replace("\r\n", "\n");
+    if text.chars().count() > TYPED {
+        let mut chars: Vec<char> = text.chars().collect();
+        let last = chars.pop();
+        let mut line = String::new();
+        for c in chars {
+            match c {
+                '\n' | '\r' | '\u{2029}' => {
+                    if !line.is_empty() {
+                        out.push(Event::Text(std::mem::take(&mut line)));
+                    }
+                    out.extend(key(Key::Enter, Modifiers::NONE));
+                }
+                c if c.is_control() && c != '\t' => {}
+                c => line.push(c),
+            }
+        }
+        if !line.is_empty() {
+            out.push(Event::Text(line));
+        }
+        if let Some(c) = last {
+            typed(&c.to_string(), out);
+        }
+        return;
+    }
     let mut run = String::new();
     let flush = |run: &mut String, out: &mut Vec<Event>| {
         if !run.is_empty() {
@@ -699,10 +870,10 @@ mod tests {
     fn a_word_composes_then_commits_with_a_space() {
         let mut s = sh("", 0);
         let p = s.apply(buf("h", 1, Some((0, 1))));
-        assert_eq!(texts(&events(&p, Target::Document)), ["[h]"]);
+        assert_eq!(texts(&events(&p, Target::Document).0), ["[h]"]);
         s.apply(buf("he", 2, Some((0, 2))));
         let p = s.apply(buf("hello ", 6, None));
-        assert_eq!(texts(&events(&p, Target::Document)), ["[]", "hello", " "], "the space alone, for AutoCorrect");
+        assert_eq!(texts(&events(&p, Target::Document).0), ["[]", "hello", " "], "the space alone, for AutoCorrect");
         assert!(!s.preedit_active());
     }
 
@@ -710,52 +881,60 @@ mod tests {
     fn backspace_inside_a_composition_only_changes_the_preedit() {
         let mut s = sh("", 0);
         s.apply(buf("hel", 3, Some((0, 3))));
-        assert_eq!(texts(&events(&s.apply(buf("he", 2, Some((0, 2)))), Target::Document)), ["[he]"]);
-        assert_eq!(texts(&events(&s.apply(buf("", 0, None)), Target::Document)), ["[]"]);
+        assert_eq!(texts(&events(&s.apply(buf("he", 2, Some((0, 2)))), Target::Document).0), ["[he]"]);
+        assert_eq!(texts(&events(&s.apply(buf("", 0, None)), Target::Document).0), ["[]"]);
     }
 
     #[test]
     fn backspaces_count_as_the_app_deletes() {
         let mut s = sh("ab\ncd", 3);
-        assert_eq!(texts(&events(&s.apply(buf("abcd", 2, None)), Target::Document)), ["Backspace"], "joins paragraphs");
+        assert_eq!(texts(&events(&s.apply(buf("abcd", 2, None)), Target::Document).0), ["Backspace"], "joins paragraphs");
         // An emoji with a skin tone is one Backspace; Devanagari deletes a character at a time.
         let mut s = sh("x👍🏽", 3);
-        assert_eq!(texts(&events(&s.apply(normalize("x", (1, 1), None)), Target::Document)), ["Backspace"]);
+        assert_eq!(texts(&events(&s.apply(normalize("x", (1, 1), None)), Target::Document).0), ["Backspace"]);
         let mut s = sh("कि", 2);
-        assert_eq!(texts(&events(&s.apply(buf("", 0, None)), Target::Document)), ["Backspace", "Backspace"]);
+        assert_eq!(texts(&events(&s.apply(buf("", 0, None)), Target::Document).0), ["Backspace", "Backspace"]);
         let mut s = sh("abcd", 2);
-        assert_eq!(texts(&events(&s.apply(buf("abd", 2, None)), Target::Document)), ["Delete"]);
-        assert_eq!(texts(&events(&sh("ab", 2).apply(buf("", 0, None)), Target::Field)), ["del(2,0)"]);
+        assert_eq!(texts(&events(&s.apply(buf("abd", 2, None)), Target::Document).0), ["Delete"]);
+        assert_eq!(texts(&events(&sh("ab", 2).apply(buf("", 0, None)), Target::Field).0), ["del(2,0)"]);
     }
 
     #[test]
     fn suggestions_and_selections() {
         let mut s = sh("teh ", 4);
-        assert_eq!(texts(&events(&s.apply(buf("the ", 4, None)), Target::Document)), ["Backspace", "Backspace", "Backspace", "he", " "]);
+        assert_eq!(texts(&events(&s.apply(buf("the ", 4, None)), Target::Document).0), ["Backspace", "Backspace", "Backspace", "he", " "]);
         let mut s = Shadow::pushed(Buf { text: "hello".chars().collect(), anchor: 0, focus: 5, compose: None });
-        assert_eq!(texts(&events(&s.apply(buf("J", 1, None)), Target::Document)), ["J"], "typing replaces the selection");
+        assert_eq!(texts(&events(&s.apply(buf("J", 1, None)), Target::Document).0), ["J"], "typing replaces the selection");
+        // The document's selection is set where the keyboard put it; a field's moves with arrows.
         let mut s = sh("abc", 3);
-        assert_eq!(texts(&events(&s.apply(buf("abc", 1, None)), Target::Document)), ["ArrowLeft", "ArrowLeft"]);
+        assert_eq!(events(&s.apply(buf("abc", 1, None)), Target::Document), (vec![], Some((-2, -2))));
         let mut s = sh("abc", 3);
         let p = s.apply(Buf { text: "abc".chars().collect(), anchor: 0, focus: 2, compose: None });
-        assert_eq!(texts(&events(&p, Target::Document)), ["ArrowLeft", "ArrowLeft", "ArrowLeft", "Shift+ArrowRight", "Shift+ArrowRight"]);
+        assert_eq!(texts(&events(&p, Target::Field).0), ["ArrowLeft", "ArrowLeft", "ArrowLeft", "Shift+ArrowRight", "Shift+ArrowRight"]);
+        // A reversed selection (the anchor after the caret) is the same text.
+        let mut s = Shadow::pushed(Buf { text: "hello".chars().collect(), anchor: 5, focus: 0, compose: None });
+        assert_eq!(texts(&events(&s.apply(buf("J", 1, None)), Target::Document).0), ["J"]);
     }
 
     #[test]
     fn line_breaks_and_tabs_are_keys() {
         let mut out = Vec::new();
-        typed("a\nb\tc\u{7}d", &mut out);
-        assert_eq!(texts(&out), ["a", "Enter", "b", "Tab", "cd"]);
+        typed("a\nb\tc\u{7}d\r\ne", &mut out);
+        assert_eq!(texts(&out), ["a", "Enter", "b", "Tab", "cd", "Enter", "e"]);
+        // A long paste goes in a line at a time, its last character typed.
+        let mut out = Vec::new();
+        typed("The quick brown fox, jumps over.\r\nThe lazy dog.", &mut out);
+        assert_eq!(texts(&out), ["The quick brown fox, jumps over.", "Enter", "The lazy dog", "."]);
     }
 
     #[test]
     fn cjk_korean_and_japanese() {
         let mut s = sh("", 0);
         s.apply(buf("ni", 2, Some((0, 2))));
-        assert_eq!(texts(&events(&s.apply(buf("你", 1, None)), Target::Document)), ["[]", "你"]);
+        assert_eq!(texts(&events(&s.apply(buf("你", 1, None)), Target::Document).0), ["[]", "你"]);
         let mut s = sh("", 0);
         s.apply(buf("한", 1, Some((0, 1))));
-        assert_eq!(texts(&events(&s.apply(buf("한ㄱ", 2, Some((1, 2)))), Target::Document)), ["[]", "한", "[ㄱ]"]);
+        assert_eq!(texts(&events(&s.apply(buf("한ㄱ", 2, Some((1, 2)))), Target::Document).0), ["[]", "한", "[ㄱ]"]);
         let mut s = sh("", 0);
         s.apply(buf("にほんご", 4, Some((0, 4))));
         assert!(s.apply(buf("にほんご", 2, Some((0, 4)))).is_empty());
@@ -765,7 +944,7 @@ mod tests {
     fn a_marked_word_stays_until_it_changes() {
         let mut s = sh("say hello", 9);
         assert!(s.apply(buf("say hello", 9, Some((4, 9)))).is_empty());
-        assert_eq!(texts(&events(&s.apply(buf("say hellos", 10, Some((4, 10)))), Target::Document)), ["[s]"]);
+        assert_eq!(texts(&events(&s.apply(buf("say hellos", 10, Some((4, 10)))), Target::Document).0), ["[s]"]);
     }
 
     fn session(text: &str) -> Session {
@@ -808,6 +987,20 @@ mod tests {
     }
 
     #[test]
+    fn the_keyboards_selection_walks_across_paragraphs() {
+        let s = session("ab\nc😀d\nef");
+        let pos = |block: usize, off: usize| Pos::body(block, off);
+        let from = pos(1, 1);
+        assert_eq!(walk(&s.doc, &from, 0), Some(pos(1, 1)));
+        assert_eq!(walk(&s.doc, &from, 1), Some(pos(1, 5)), "over the emoji's four bytes");
+        assert_eq!(walk(&s.doc, &from, -2), Some(pos(0, 2)), "the paragraph break counts as one");
+        assert_eq!(walk(&s.doc, &from, 3), Some(pos(2, 0)));
+        assert_eq!(walk(&s.doc, &from, -99), Some(pos(0, 0)), "stops at the story's start");
+        assert_eq!(walk(&s.doc, &from, isize::MAX), Some(pos(2, 2)));
+        assert_eq!(walk(&s.doc, &pos(9, 0), 1), None);
+    }
+
+    #[test]
     fn pushes_follow_the_document_and_echoes_are_quiet() {
         let s = session("teh");
         let mut ime = Ime::default();
@@ -817,25 +1010,66 @@ mod tests {
         let w = Window::of_document(&s.doc, &s.sel);
         ime.after_frame(Some(Target::Document), w.clone(), true);
         let r = ime.take_requests();
-        assert!(matches!(r.as_slice(), [Request::Push { text, focus: 3, generation: 1, .. }, Request::Show] if text == "teh"), "{r:?}");
+        // The document's start is a line break, so a Backspace there reaches the app.
+        assert!(matches!(r.as_slice(), [Request::Push { text, focus: 4, generation: 1, .. }, Request::Show] if text == "\nteh"), "{r:?}");
         // The IME echoes the push: nothing to do, nothing to push.
-        assert!(ime.state(1, buf("teh", 3, Some((0, 3)))).is_empty());
+        assert!(ime.state(1, buf("\nteh", 4, Some((1, 4)))).is_empty());
         ime.after_frame(Some(Target::Document), w.clone(), false);
         assert!(ime.take_requests().is_empty());
         // The user types a space; the app's AutoCorrect makes it "the ": one push.
-        assert_eq!(texts(&ime.state(1, buf("teh ", 4, None))), [" "]);
-        let corrected = Window { before: "the ".chars().collect(), after: vec![], anchor: 0 };
+        assert_eq!(texts(&ime.state(1, buf("\nteh ", 5, None))), [" "]);
+        let corrected = Window { before: "\nthe ".chars().collect(), after: vec![], anchor: 0, edges: (true, true) };
         ime.after_frame(Some(Target::Document), Some(corrected.clone()), false);
         assert!(matches!(ime.take_requests().as_slice(), [Request::Push { generation: 2, .. }]));
-        ime.after_frame(Some(Target::Document), Some(corrected), false);
+        ime.after_frame(Some(Target::Document), Some(corrected.clone()), false);
+        assert!(ime.take_requests().is_empty());
+        // A late echo of the replaced push changes nothing and asks for no push (or they'd echo for ever).
+        assert!(ime.state(1, buf("\nteh ", 5, None)).is_empty());
+        ime.after_frame(Some(Target::Document), Some(corrected.clone()), false);
         assert!(ime.take_requests().is_empty());
         // A state on the replaced push: its composition is typed, and a push follows.
-        assert_eq!(texts(&ime.state(1, buf("teh c", 5, Some((4, 5))))), ["[]", "c"]);
+        assert_eq!(texts(&ime.state(1, buf("\nteh c", 6, Some((5, 6))))), ["[]", "c"]);
+        ime.after_frame(Some(Target::Document), Some(corrected), false);
+        assert!(matches!(ime.take_requests().as_slice(), [Request::Push { generation: 3, .. }]));
         // Two frames without a target hide the keyboard.
         ime.after_frame(None, None, false);
         ime.after_frame(None, None, false);
         assert_eq!(ime.take_requests(), [Request::Hide]);
         assert!(!ime.active());
+    }
+
+    #[test]
+    fn a_composition_is_typed_before_a_push_replaces_it() {
+        let mut ime = Ime::default();
+        let w = |t: &str| Some(Window { before: t.chars().collect(), after: vec![], anchor: 0, edges: (true, true) });
+        ime.after_frame(Some(Target::Document), w("\nab"), true);
+        let _ = ime.take_requests();
+        assert_eq!(texts(&ime.state(1, buf("\nab c", 5, Some((4, 5))))), [" ", "[c]"]);
+        // A push mid-composition waits for it to end, unless one is due anyway (a state the host can't
+        // place): the push types the composition first.
+        ime.after_frame(Some(Target::Document), w("\nXab "), false);
+        assert!(ime.take_requests().is_empty());
+        assert!(ime.state(7, buf("?", 1, None)).is_empty());
+        ime.after_frame(Some(Target::Document), w("\nXab "), false);
+        assert!(matches!(ime.take_requests().as_slice(), [Request::Push { generation: 2, .. }]));
+        assert_eq!(texts(&ime.take_events()), ["[]", "c"]);
+    }
+
+    #[test]
+    fn edges_decide_whether_a_shorter_window_agrees() {
+        let s = Shadow::pushed(buf("\nab", 3, None));
+        let mut s = s;
+        s.edges = (true, true);
+        let w = |t: &str, edges| Window { before: t.chars().collect(), after: vec![], anchor: 0, edges };
+        assert!(s.consistent(&w("\nab", (true, true))));
+        // Both reach the start: a missing character is a change, not a shorter cut.
+        assert!(!s.consistent(&w("\nb", (true, true))));
+        // A cut window agrees with the end of what the keyboard holds.
+        assert!(s.consistent(&w("ab", (false, true))));
+        assert!(!s.consistent(&w("xb", (false, true))));
+        // At the start of the document, a Backspace on the line break that stands for it is a key.
+        let mut s = Shadow::pushed(buf("\n", 1, None));
+        assert_eq!(texts(&events(&s.apply(buf("", 0, None)), Target::Document).0), ["Backspace"]);
     }
 
     #[test]
@@ -854,7 +1088,7 @@ mod tests {
         let texts = ["", "a", "😀", "a😀b\n", "한ㄱ", "\u{FFFC}x", "\u{0301}e", "कि"];
         let nums = [i64::MIN, -1, 0, 1, 2, 3, 5, 1000, i64::MAX];
         let mut ime = Ime::default();
-        ime.after_frame(Some(Target::Document), Some(Window { before: vec!['a'], after: vec![], anchor: 0 }), true);
+        ime.after_frame(Some(Target::Document), Some(Window { before: vec!['a'], after: vec![], anchor: 0, edges: (true, true) }), true);
         let mut n: u64 = 1;
         for i in 0..20_000u32 {
             n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -867,10 +1101,12 @@ mod tests {
                 let _ = ime.commit();
                 ime.after_frame(
                     Some(Target::Document),
-                    Some(Window { before: t.chars().collect(), after: vec![], anchor: k(5).clamp(-3, 3) as isize }),
+                    Some(Window { before: t.chars().collect(), after: vec![], anchor: k(5).clamp(-3, 3) as isize, edges: (n & 4 == 0, n & 8 == 0) }),
                     n & 2 == 0,
                 );
                 let _ = ime.take_requests();
+                let _ = ime.take_events();
+                let _ = ime.take_select();
             }
         }
     }

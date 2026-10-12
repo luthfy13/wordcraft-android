@@ -15,7 +15,6 @@ import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
 import android.util.Log
-import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.PointerIcon
 import android.view.View
@@ -180,13 +179,13 @@ class MainActivity : GameActivity() {
     }
 
     /**
-     * Keys from a hardware keyboard go straight to the app, also while the on-screen keyboard's connection
-     * is open (which would otherwise take arrows, Tab, Enter and Backspace, losing Shift and Ctrl). Keys
-     * from on-screen keyboards, and system keys, take the usual way.
+     * Keys go straight to the app, also while the on-screen keyboard's connection is open: GameTextInput would
+     * otherwise apply them to its own buffer (taking arrows, Tab, Enter and Backspace from a hardware
+     * keyboard, losing Shift and Ctrl) and restart the on-screen keyboard after each. The app pushes the
+     * keyboard a fresh buffer when the document changes. System keys take the usual way.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val hardware = event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD && event.flags and KeyEvent.FLAG_SOFT_KEYBOARD == 0
-        if (hardware && !event.isSystem) {
+        if (!event.isSystem) {
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> return onKeyDown(event.keyCode, event)
                 KeyEvent.ACTION_UP -> return onKeyUp(event.keyCode, event)
