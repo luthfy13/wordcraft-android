@@ -17,6 +17,7 @@ use serde_json::json;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
+use crate::about::About;
 use crate::files::{FileEvent, FileOp, Files};
 use crate::ime::{self, Ime, Target};
 use crate::input::{Action, KeyPress, Motion, TAP_SLOP, Tool, Translator};
@@ -84,8 +85,11 @@ pub struct Host {
     /// Documents to hand the app as dropped files in the next frame (Open with, Share).
     dropped: Vec<PathBuf>,
     prompts: Prompts,
+    about: About,
     /// The pointer's shape last sent.
     cursor: Option<CursorIcon>,
+    /// The window title last sent (the document's name).
+    title: Option<String>,
     /// The app's state when Back was pressed: if Back (as Esc) changes nothing, the app goes to the
     /// background.
     back: Option<BackState>,
@@ -123,7 +127,10 @@ impl Host {
         let mut app = WordApp::new(Session::new(doc), services(&clipboard, platform.as_ref(), files.as_ref(), dirs.as_ref()));
         let mut recovery = None;
         if let Some(dirs) = &dirs {
-            store::load_prefs(dirs, &mut app);
+            // A tablet follows the system's light or dark mode until the user picks one (File › Options).
+            if !store::load_prefs(dirs, &mut app) {
+                app.ui.theme = wordcraft_ui_egui::theme::Appearance::System;
+            }
             let mut r = Recovery::new(dirs.recovery());
             if let Some(message) = r.restore(&mut app) {
                 log::info!("{message}");
@@ -152,7 +159,9 @@ impl Host {
             files,
             dropped: Vec::new(),
             prompts: Prompts::default(),
+            about: About::default(),
             cursor: None,
+            title: None,
             back: None,
             quitting: None,
             ime: Ime::default(),
@@ -386,7 +395,7 @@ impl Host {
 
     pub fn key(&mut self, k: &KeyPress) {
         if k.keycode == code::BACK && k.pressed && self.back.is_none() {
-            self.back = Some(BackState::of(&self.app, &self.ctx));
+            self.back = Some(BackState::of(&self.app, &self.ctx, self.about.is_open()));
         }
         // A key ends the keyboard's composition first, where it is.
         if k.pressed && !keymap::is_modifier(k.keycode) {
@@ -428,11 +437,14 @@ impl Host {
         );
         raw.dropped_files = self.dropped.drain(..).map(|path| Arc::new(LocalFile(path)) as egui::DroppedFileHandle).collect();
         self.app.raw_input_hook(&mut raw);
-        let (app, prompts, files, platform) = (&mut self.app, &mut self.prompts, &mut self.files, self.platform.as_deref());
+        let (app, prompts, about, files, platform) = (&mut self.app, &mut self.prompts, &mut self.about, &mut self.files, self.platform.as_deref());
         let out = self.ctx.run_ui(raw, |ui| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
+            about.intercept(app);
             app.ui(ui);
+            about.intercept(app);
+            about.show(&ctx);
             prompts.show(ui, app, files.as_mut(), platform);
         });
         self.after_frame_ime(&out.platform_output);
@@ -452,6 +464,14 @@ impl Host {
                 OutputCommand::CopyImage(_) => {}
             }
         }
+        // The document's name as the window's title: screen readers announce it, and freeform windows show it.
+        let title = self.app.title_stem();
+        if self.title.as_ref() != Some(&title) {
+            if let Some(p) = &self.platform {
+                p.call("title", json!({"title": title}));
+            }
+            self.title = Some(title);
+        }
         let cursor = out.platform_output.cursor_icon;
         if self.cursor != Some(cursor) {
             self.cursor = Some(cursor);
@@ -460,7 +480,7 @@ impl Host {
             }
         }
         if let Some(before) = self.back.take()
-            && before == BackState::of(&self.app, &self.ctx)
+            && before == BackState::of(&self.app, &self.ctx, self.about.is_open())
             && let Some(p) = &self.platform
         {
             // Back with nothing to close: the app goes to the background, as at any app's root.
@@ -552,6 +572,8 @@ impl Host {
 /// What Back (sent as Esc) may close or end; when none of it changes, Back leaves the app.
 #[derive(PartialEq)]
 struct BackState {
+    /// The host's own About.
+    about: bool,
     dialog: bool,
     file_dialog: bool,
     backstage: bool,
@@ -565,8 +587,9 @@ struct BackState {
 }
 
 impl BackState {
-    fn of(app: &WordApp, ctx: &egui::Context) -> Self {
+    fn of(app: &WordApp, ctx: &egui::Context, about: bool) -> Self {
         Self {
+            about,
             dialog: app.dialog.is_some(),
             file_dialog: app.file_dialog_open(),
             backstage: app.ui.backstage,
@@ -823,8 +846,12 @@ mod tests {
     }
 
     fn android(dirs: Option<Dirs>) -> (Host, Rc<Fake>) {
+        android_with(dirs, true)
+    }
+
+    fn android_with(dirs: Option<Dirs>, sample: bool) -> (Host, Rc<Fake>) {
         let fake = Rc::new(Fake::default());
-        let mut host = Host::new(&Launch { sample: true }, dirs, Some(Rc::clone(&fake) as Rc<dyn Platform>));
+        let mut host = Host::new(&Launch { sample }, dirs, Some(Rc::clone(&fake) as Rc<dyn Platform>));
         host.set_window(Some(tablet()));
         host.set_max_texture_side(8192);
         for _ in 0..3 {
@@ -931,7 +958,10 @@ mod tests {
 
     #[test]
     fn the_on_screen_keyboard_types_into_the_document() {
-        let (mut host, _fake) = android(None);
+        // A blank document: a tap anywhere on the page puts the caret in its one paragraph, whatever the fonts.
+        let (mut host, _fake) = android_with(None, false);
+        host.app_mut().run("text.insert", json!({"text": "Hello"})).unwrap();
+        step(&mut host);
         host.take_ime_requests();
         tap(&mut host, 1280.0, 700.0);
         step(&mut host);
@@ -959,6 +989,38 @@ mod tests {
         assert!(!host.take_ime_requests().iter().any(|r| matches!(r, ime::Request::Push { .. })));
         // A mouse click elsewhere ends nothing and doesn't bring the keyboard back; hardware typing goes on.
         press(&mut host, code::A + 25, 0);
+    }
+
+    #[test]
+    fn the_interface_follows_the_system_until_the_user_picks() {
+        let root = crate::store::tests::temp_dir("host-theme");
+        let (mut host, _fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(host.app().ui.theme, wordcraft_ui_egui::theme::Appearance::System);
+        host.set_system_theme(Some(Theme::Dark));
+        step(&mut host);
+        assert!(host.app().ui_is_dark());
+        host.set_system_theme(Some(Theme::Light));
+        step(&mut host);
+        assert!(!host.app().ui_is_dark());
+        // The user's choice is kept.
+        host.app_mut().ui.theme = wordcraft_ui_egui::theme::Appearance::Dark;
+        host.persist();
+        drop(host);
+        let (host, _fake) = android(Some(Dirs::new(&root)));
+        assert_eq!(host.app().ui.theme, wordcraft_ui_egui::theme::Appearance::Dark);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn about_shows_folio_writer() {
+        let (mut host, _fake) = android(None);
+        host.app_mut().run("ui.dialog", json!({"name": "about"})).unwrap();
+        step(&mut host);
+        assert!(host.app().dialog.is_none(), "the app's own About doesn't show");
+        assert!(host.about.is_open());
+        press(&mut host, code::BACK, 0);
+        step(&mut host);
+        assert!(!host.about.is_open(), "Back closes it");
     }
 
     #[test]

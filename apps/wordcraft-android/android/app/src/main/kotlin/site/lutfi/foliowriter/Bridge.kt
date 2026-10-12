@@ -96,6 +96,11 @@ object Bridge {
             "print" -> ok(onUi { it.printPdf(File(a.getString("path")), a.optString("name", LABEL)) })
             "share" -> ok(share(a))
             "moveTaskToBack" -> ok(onUi { it.moveTaskToBack(true) })
+            "title" -> {
+                val title = a.optString("title")
+                onUi { it.title = if (title.isEmpty()) LABEL else "$title – $LABEL" }
+                null
+            }
             "imePush" -> {
                 val text = a.getString("text")
                 val anchor = a.getInt("anchor")

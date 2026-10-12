@@ -114,6 +114,10 @@ if ! adb install -r -t -g "$apk" >"$out/install.txt" 2>&1; then
 fi
 
 run vulkan-or-gl "--sample"
+# The system's fonts are found (more than the 13 bundled families and Noto Emoji).
+families=$(grep -oE 'system fonts: [0-9]+ families' "$out/vulkan-or-gl-logcat.txt" | grep -oE '[0-9]+' | head -n 1)
+echo "system font families: ${families:-none}"
+[ "${families:-0}" -gt 20 ] || fail "the system fonts weren't found (${families:-no} families)"
 run gl "--sample --backend gl"
 
 echo "::group::recovery"

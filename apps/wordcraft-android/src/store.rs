@@ -67,26 +67,50 @@ impl Dirs {
 /// Loads what lives outside `ui.json` and must be in place before a document is laid out: added fonts and
 /// the Hunspell folder. Process-wide, like the desktop app's.
 pub fn load_fonts_and_dictionaries(dirs: &Dirs) {
-    let (loaded, skipped) = wordcraft_fonts::FontDb::global().load_user_fonts(&dirs.fonts());
+    let db = wordcraft_fonts::FontDb::global();
+    let (loaded, skipped) = db.load_user_fonts(&dirs.fonts());
     if !loaded.is_empty() || !skipped.is_empty() {
         log::info!("added fonts: {} loaded, {} skipped", loaded.len(), skipped.len());
+    }
+    // Android's emoji fonts are colour bitmaps or COLR glyphs, which the page renderer can't draw yet:
+    // the monochrome Noto Emoji egui embeds (OFL) draws the common ones instead of a blank.
+    if let Some(emoji) = egui::FontDefinitions::default().font_data.get("NotoEmoji-Regular") {
+        db.add_font(emoji.font.to_vec());
+    }
+    // The system font list is read once, on its own thread, before a menu or document needs it.
+    let scan = std::thread::Builder::new().name("font-scan".into()).spawn(move || {
+        log::info!("system fonts: {} families", db.families().len());
+    });
+    if let Err(e) = scan {
+        log::warn!("can't scan the system fonts in the background: {e}");
     }
     wordcraft_engine::proof::hunspell::set_dictionary_dir(Some(dirs.hunspell()));
 }
 
-/// Applies the saved settings and the custom dictionary. A missing or unreadable file leaves the defaults.
-pub fn load_prefs(dirs: &Dirs, app: &mut WordApp) {
-    match read_capped(&dirs.prefs(), MAX_PREFS) {
+/// Applies the saved settings and the custom dictionary; whether there were settings. A missing or
+/// unreadable file leaves the defaults.
+pub fn load_prefs(dirs: &Dirs, app: &mut WordApp) -> bool {
+    let applied = match read_capped(&dirs.prefs(), MAX_PREFS) {
         Ok(Some(bytes)) => match UiState::from_json(&bytes) {
-            Some(ui) => app.apply_prefs(ui),
-            None => log::warn!("the settings file isn't valid: using the defaults"),
+            Some(ui) => {
+                app.apply_prefs(ui);
+                true
+            }
+            None => {
+                log::warn!("the settings file isn't valid: using the defaults");
+                false
+            }
         },
-        Ok(None) => {}
-        Err(e) => log::warn!("can't read the settings: {e}"),
-    }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("can't read the settings: {e}");
+            false
+        }
+    };
     let dictionary = dirs.dictionary();
     wordcraft_engine::proof::load_user_dictionary(&dictionary);
     app.session.user_dict_path = Some(dictionary);
+    applied
 }
 
 /// Writes the settings (atomically).
@@ -168,14 +192,14 @@ pub(crate) mod tests {
         let dir = temp_dir("prefs");
         let dirs = Dirs::new(&dir);
         let mut first = app();
-        load_prefs(&dirs, &mut first);
+        assert!(!load_prefs(&dirs, &mut first), "nothing saved yet");
         first.ui.recent = vec!["/data/doc.docx".into()];
         first.ui.recent_count = 7;
         first.session.author = "Ayu".into();
         save_prefs(&dirs, &first).unwrap();
 
         let mut second = app();
-        load_prefs(&dirs, &mut second);
+        assert!(load_prefs(&dirs, &mut second));
         assert_eq!(second.ui.recent, ["/data/doc.docx"]);
         assert_eq!(second.ui.recent_count, 7);
         assert_eq!(second.session.author, "Ayu");
