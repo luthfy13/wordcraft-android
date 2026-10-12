@@ -3466,6 +3466,17 @@ mod tests {
     /// pinned to a concrete appearance (macOS would stop reporting OS changes), and our palette
     /// follows each OS appearance egui reports.
     #[test]
+    fn the_community_setting_hides_the_discord_link() {
+        let mut a = app();
+        a.ui.show_discord = false;
+        assert_eq!(a.run("ui.discord", json!({})).unwrap()["hidden"], true);
+        assert!(a.canvas.open_url.is_none(), "no link opens");
+        a.ui.show_discord = true;
+        a.run("ui.discord", json!({})).unwrap();
+        assert_eq!(a.canvas.open_url.as_deref(), Some("https://discord.gg/artcraft"));
+    }
+
+    #[test]
     fn system_theme_follows_the_os_without_pinning_the_window() {
         use egui::{SystemTheme, Theme, ThemePreference, ViewportCommand};
         let ctx = egui::Context::default();
