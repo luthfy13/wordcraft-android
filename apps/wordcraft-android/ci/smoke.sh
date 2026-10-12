@@ -4,8 +4,11 @@
 #
 # It installs the APK and starts it with the sample document, once per graphics backend (Vulkan with the
 # OpenGL ES fallback, then OpenGL ES alone). Each run must draw its first frame, stay alive and in front,
-# draw something other than a blank window, and log no crash. Then a deliberate panic (debug builds only)
-# must reach logcat with a backtrace that names functions. Screenshots and logs go to OUTDIR.
+# draw something other than a blank window, and log no crash. Then:
+# - recovery: text typed into a new document survives the app being killed;
+# - sharing: text shared with the app opens as a document;
+# - a deliberate panic (debug builds only) must reach logcat with a backtrace that names functions.
+# Screenshots and logs go to OUTDIR.
 #
 # Usage: smoke.sh APK OUTDIR
 set -uo pipefail
@@ -62,7 +65,7 @@ PY
 
 # run NAME ARGS: one start with launch flags ARGS, checked; artefacts are named NAME.
 run() {
-  local name=$1 args=$2 pid
+  local name=$1 args=$2
   echo "::group::$name ($args)"
   start "$args" >"$out/$name-start.txt" 2>&1
   cat "$out/$name-start.txt"
@@ -71,6 +74,13 @@ run() {
   fi
   # Let it settle: the app's first frames, the caret, any late failure.
   sleep 8
+  check "$name"
+  echo "::endgroup::"
+}
+
+# check NAME: the app is alive, in front, drew something and logged no crash; artefacts are named NAME.
+check() {
+  local name=$1 pid
   pid=$(adb shell pidof "$pkg" | tr -d '\r')
   [ -n "$pid" ] || fail "$name: $pkg is not running"
   adb shell dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' >"$out/$name-focus.txt" || true
@@ -86,7 +96,6 @@ run() {
     cat "$out/$name-crash.txt"
     fail "$name: crash in logcat"
   fi
-  echo "::endgroup::"
 }
 
 adb wait-for-device
@@ -106,6 +115,35 @@ fi
 
 run vulkan-or-gl "--sample"
 run gl "--sample --backend gl"
+
+echo "::group::recovery"
+# A new document, typed into, then the process killed without warning (as Android does in the
+# background): the next start brings the text back.
+adb shell pm clear "$pkg" >/dev/null
+start "" >"$out/recovery-start.txt" 2>&1
+if wait_for_log 'FolioWriter.*first frame after' 90; then
+  sleep 3
+  adb shell input text "Recovered%stext"
+  wait_for_log 'FolioWriter.*recovery snapshot written' 30 || fail "recovery: no snapshot written"
+  adb logcat -d -b all -v threadtime >"$out/recovery-before-logcat.txt"
+  adb shell am force-stop "$pkg"
+  start "" >>"$out/recovery-start.txt" 2>&1
+  wait_for_log 'FolioWriter.*Recovered an unsaved document' 90 || fail "recovery: the document didn't come back"
+  sleep 5
+  check recovery
+else
+  fail "recovery: no first frame within 90 s"
+fi
+echo "::endgroup::"
+
+echo "::group::share text"
+adb logcat -b all -c || true
+adb shell am start -W -n "$activity" -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT "'Shared with Folio Writer'" >"$out/share-start.txt" 2>&1
+cat "$out/share-start.txt"
+wait_for_log 'FolioWriter.*opening a document sent to the app' 60 || fail "share: the shared text didn't open"
+sleep 5
+check share
+echo "::endgroup::"
 
 echo "::group::panic test"
 start "--sample --panic-test" >"$out/panic-start.txt" 2>&1

@@ -515,6 +515,7 @@ impl Files {
             let (_, entry, path) = self.incoming.remove(i);
             match result {
                 Ok(remote) => {
+                    log::info!("opening a document sent to the app");
                     if let Some(id) = entry {
                         self.synced_in(id, remote, &path);
                     }
