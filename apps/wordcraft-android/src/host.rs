@@ -138,7 +138,7 @@ impl Host {
             }
             recovery = Some(r);
         }
-        // The ArtCraft brand licence (docs/brand/LICENSE-brand.txt) keeps its marks out of modified
+        // The ArtCraft brand licence (upstream's docs/brand/LICENSE-brand.txt) keeps its marks out of modified
         // versions: the "Join the ArtCraft community" button stays hidden, whatever the settings say.
         // About still names ArtCraft (that needs a hook in ui-egui).
         app.ui.show_discord = false;

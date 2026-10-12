@@ -1,5 +1,5 @@
 //! Help › About, as Folio Writer: its name and sources, the licences of everything it ships, and
-//! WordCraft's contributors. The ArtCraft brand licence (`docs/brand/LICENSE-brand.txt`) keeps its marks out
+//! WordCraft's contributors. The ArtCraft brand licence (upstream's `docs/brand/LICENSE-brand.txt`) keeps its marks out
 //! of modified versions, so the host shows this instead of the app's own About (which names ArtCraft);
 //! the copyright notices stay, as the licences require.
 
