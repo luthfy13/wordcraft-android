@@ -84,6 +84,13 @@ class MainActivity : GameActivity() {
         super.onSaveInstanceState(outState)
     }
 
+    override fun onStop() {
+        Bridge.stopping()
+        super.onStop()
+        // The app may be killed from here on: the snapshot of unsaved changes is written first.
+        Bridge.awaitSaved(1500)
+    }
+
     override fun onDestroy() {
         Bridge.detach(this)
         super.onDestroy()
@@ -229,23 +236,29 @@ class MainActivity : GameActivity() {
         override fun parseResult(resultCode: Int, intent: Intent?): Intent? = if (resultCode == Activity.RESULT_OK) intent else null
     }
 
-    /** Prints an existing PDF: one document, every page, copied as is. */
+    /** Prints an existing PDF: one document, every page, copied as is (on its own thread). */
     private class PdfFileAdapter(private val file: File, private val name: String) : PrintDocumentAdapter() {
+        private var laidOut = false
+
         override fun onLayout(oldAttributes: PrintAttributes?, newAttributes: PrintAttributes, cancellationSignal: CancellationSignal?, callback: LayoutResultCallback, extras: Bundle?) {
             if (cancellationSignal?.isCanceled == true) {
                 callback.onLayoutCancelled()
                 return
             }
-            callback.onLayoutFinished(PrintDocumentInfo.Builder(name).setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT).build(), true)
+            // The PDF doesn't change with the printer's settings.
+            callback.onLayoutFinished(PrintDocumentInfo.Builder(name).setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT).build(), !laidOut)
+            laidOut = true
         }
 
         override fun onWrite(pages: Array<out PageRange>, destination: ParcelFileDescriptor, cancellationSignal: CancellationSignal?, callback: WriteResultCallback) {
-            try {
-                FileInputStream(file).use { input -> FileOutputStream(destination.fileDescriptor).use { input.copyTo(it) } }
-                callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
-            } catch (e: Exception) {
-                callback.onWriteFailed(e.javaClass.name)
-            }
+            Thread {
+                try {
+                    FileInputStream(file).use { input -> FileOutputStream(destination.fileDescriptor).use { input.copyTo(it) } }
+                    if (cancellationSignal?.isCanceled == true) callback.onWriteCancelled() else callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.javaClass.name)
+                }
+            }.start()
         }
     }
 

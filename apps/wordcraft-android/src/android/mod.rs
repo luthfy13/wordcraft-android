@@ -283,7 +283,13 @@ impl State {
             }
             MainEvent::LowMemory => log::info!("the system is low on memory"),
             // The app may be killed from here on without another word.
-            MainEvent::Pause | MainEvent::Stop => self.host.persist(),
+            MainEvent::Pause => self.host.persist(),
+            // `onStop` waits for this (`platform::saved`).
+            MainEvent::Stop => {
+                self.host.persist();
+                self.host.wait_for_files(Duration::from_millis(1400));
+                platform::saved::done();
+            }
             MainEvent::Destroy => self.quit = true,
             _ => {}
         }

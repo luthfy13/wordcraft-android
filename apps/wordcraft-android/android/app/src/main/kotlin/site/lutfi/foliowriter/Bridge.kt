@@ -154,7 +154,7 @@ object Bridge {
             report(JSONObject().put("event", "picked").put("req", req).put("cancelled", true))
             return
         }
-        val flags = result.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        val flags = result.flags
         io.execute {
             val event = try {
                 describe(uri, create, persist || create, flags).put("event", "picked").put("req", req)
@@ -190,24 +190,27 @@ object Bridge {
     /** A document's name, type, size, last change and whether the app may write it. */
     private fun describe(uri: Uri, create: Boolean, persist: Boolean, flags: Int): JSONObject {
         val resolver = resolver() ?: throw IllegalStateException()
-        var persisted = false
-        if (persist && uri.scheme == ContentResolver.SCHEME_CONTENT) {
-            // Only grants the picker marked persistable can be kept.
-            val keep = flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            if (keep != 0) {
-                persisted = try {
-                    resolver.takePersistableUriPermission(uri, keep)
-                    true
+        // Keep the permission when the picker offered it (Open with's never is): read and write, else read.
+        var kept = 0
+        if (persist && uri.scheme == ContentResolver.SCHEME_CONTENT && flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
+            val offered = flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            for (mode in intArrayOf(offered, Intent.FLAG_GRANT_READ_URI_PERMISSION)) {
+                if (mode == 0 || mode and offered != mode) continue
+                try {
+                    resolver.takePersistableUriPermission(uri, mode)
+                    kept = mode
+                    break
                 } catch (e: SecurityException) {
-                    false
+                    // Not offered in this mode.
                 }
             }
         }
         val meta = query(resolver, uri)
         val docFlags = meta.flags
         val supportsWrite = docFlags?.let { it and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0 }
-        val granted = flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0
+        val granted = flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0 && (kept == 0 || kept and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0)
         val writable = create || (granted && supportsWrite != false)
+        val persisted = kept != 0
         return JSONObject()
             .put("uri", uri.toString())
             .put("name", meta.name ?: uri.lastPathSegment ?: "Document")
@@ -341,34 +344,36 @@ object Bridge {
     }
 
     /**
-     * Replaces the document's content with [path]'s. "wt" truncates; a provider that refuses it is written
-     * in "rw" mode and truncated to the new length, so no old bytes are left after the end.
+     * Replaces the document's content with [path]'s. Providers differ on which modes they take and whether
+     * "w" truncates: "wt", then "rwt", then "w", and the file is truncated to the new length where it can
+     * be, so no old bytes are left after the end.
      */
     private fun write(resolver: ContentResolver, uri: Uri, path: File) {
-        val truncating = try {
-            resolver.openOutputStream(uri, "wt")
-        } catch (e: IllegalArgumentException) {
-            null
-        } catch (e: UnsupportedOperationException) {
-            null
-        }
-        if (truncating != null) {
-            truncating.use { out ->
-                FileInputStream(path).use { it.copyTo(out, 64 * 1024) }
-                out.flush()
-                (out as? FileOutputStream)?.let { f -> try { f.fd.sync() } catch (e: IOException) { } }
+        var pfd: android.os.ParcelFileDescriptor? = null
+        var last: Exception? = null
+        for (mode in arrayOf("wt", "rwt", "w")) {
+            try {
+                pfd = resolver.openFileDescriptor(uri, mode)
+                if (pfd != null) break
+            } catch (e: IllegalArgumentException) {
+                last = e
+            } catch (e: UnsupportedOperationException) {
+                last = e
             }
-            return
         }
-        val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw FileNotFoundException()
-        pfd.use {
-            FileOutputStream(it.fileDescriptor).use { out ->
-                val channel = out.channel
-                channel.position(0)
-                val length = FileInputStream(path).use { input -> input.copyTo(out, 64 * 1024) }
-                out.flush()
-                channel.truncate(length)
-                try { out.fd.sync() } catch (e: IOException) { }
+        val fd = pfd ?: throw (last as? RuntimeException ?: FileNotFoundException())
+        android.os.ParcelFileDescriptor.AutoCloseOutputStream(fd).use { out ->
+            FileInputStream(path).use { it.copyTo(out, 64 * 1024) }
+            out.flush()
+            try {
+                out.channel.truncate(out.channel.position())
+            } catch (e: IOException) {
+                // A pipe: nothing to truncate.
+            }
+            try {
+                out.fd.sync()
+            } catch (e: IOException) {
+                // Not a file: the provider syncs.
             }
         }
     }
@@ -405,10 +410,14 @@ object Bridge {
 
     private fun release(a: JSONObject): String? {
         val resolver = resolver() ?: return null
-        try {
-            resolver.releasePersistableUriPermission(Uri.parse(a.getString("uri")), Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        } catch (e: SecurityException) {
-            // Already gone.
+        val uri = Uri.parse(a.getString("uri"))
+        for (mode in intArrayOf(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION, Intent.FLAG_GRANT_READ_URI_PERMISSION)) {
+            try {
+                resolver.releasePersistableUriPermission(uri, mode)
+                break
+            } catch (e: SecurityException) {
+                // Not held in this mode (or already gone).
+            }
         }
         return null
     }
@@ -453,6 +462,17 @@ object Bridge {
         }
     }
 
+    /** The activity is stopping: the host writes the settings and a snapshot of unsaved changes. */
+    fun stopping() = nativeStopping()
+
+    /**
+     * Waits up to [ms] for what [stopping] started (the process could be killed once `onStop` returns). The
+     * native thread does the writing; this only waits.
+     */
+    fun awaitSaved(ms: Int) = nativeAwaitSaved(ms)
+
     private external fun nativeInit()
     private external fun nativeEvent(json: String)
+    private external fun nativeStopping()
+    private external fun nativeAwaitSaved(ms: Int)
 }

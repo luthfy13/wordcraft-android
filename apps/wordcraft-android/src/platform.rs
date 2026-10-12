@@ -176,6 +176,49 @@ pub fn parse(json: &str) -> Option<Inbound> {
     Some(Inbound::File(event))
 }
 
+/// `onStop` waits (boundedly) for the settings and the recovery snapshot: once it returns, Android may kill
+/// the process without another word.
+pub mod saved {
+    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// Stops asked for, and the last one whose files are written.
+    static STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    static DONE: Condvar = Condvar::new();
+
+    fn lock() -> MutexGuard<'static, (u64, u64)> {
+        STATE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The activity is stopping (UI thread, before the loop hears of it).
+    pub fn stopping() {
+        let mut s = lock();
+        s.0 = s.0.wrapping_add(1);
+    }
+
+    /// The loop wrote what a stop needs.
+    pub fn done() {
+        let mut s = lock();
+        s.1 = s.0;
+        DONE.notify_all();
+    }
+
+    /// Waits up to `timeout` for the stops asked for so far; whether they were done.
+    pub fn wait(timeout: Duration) -> bool {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut s = lock();
+        let want = s.0;
+        while s.1 < want {
+            let left = deadline.map_or(Duration::ZERO, |d| d.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                return false;
+            }
+            s = DONE.wait_timeout(s, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        true
+    }
+}
+
 /// Reports waiting for the `android_main` loop.
 pub mod inbox {
     use std::collections::VecDeque;
@@ -292,6 +335,20 @@ mod tests {
         assert_eq!(op, "writeBack");
         assert_eq!(args["expect"], json!({"modified": null, "size": null}));
         assert_eq!(grants(&json!({"uris": ["a", 1, "b"]})), Some(vec!["a".to_owned(), "b".to_owned()]));
+    }
+
+    #[test]
+    fn stopping_waits_for_the_files() {
+        use std::time::Duration;
+        saved::stopping();
+        assert!(!saved::wait(Duration::from_millis(20)), "not written yet");
+        let writer = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            saved::done();
+        });
+        assert!(saved::wait(Duration::from_secs(10)));
+        writer.join().unwrap();
+        assert!(saved::wait(Duration::ZERO), "nothing more to wait for");
     }
 
     #[test]

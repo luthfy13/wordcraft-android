@@ -908,8 +908,9 @@ const TYPES: &[(&str, &str)] = &[
     ("doc", "application/msword"),
     ("dot", "application/msword"),
     ("odt", "application/vnd.oasis.opendocument.text"),
-    ("rtf", "application/rtf"),
+    // Android's own type for .rtf first: the one to create documents with.
     ("rtf", "text/rtf"),
+    ("rtf", "application/rtf"),
     ("txt", "text/plain"),
     ("md", "text/markdown"),
     ("html", "text/html"),

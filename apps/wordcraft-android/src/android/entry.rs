@@ -1,5 +1,5 @@
 //! The symbols Android finds by name: `android_main`, which GameActivity's native thread calls, and the
-//! native methods `MainActivity.nativeSetLaunchArgs`, `Bridge.nativeInit` and `Bridge.nativeEvent`.
+//! native methods `MainActivity.nativeSetLaunchArgs` and `Bridge.native*`.
 //!
 //! Exporting an unmangled symbol is `unsafe` in Rust 2024 (`#[unsafe(no_mangle)]`), so this module is
 //! the crate's one exception to `unsafe_code = "deny"`. It has no `unsafe` block.
@@ -12,7 +12,7 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString};
 use jni::{EnvUnowned, Outcome};
 
-use crate::platform::inbox;
+use crate::platform::{inbox, saved};
 
 /// The launching intent's flags, set before the activity starts the native thread.
 static LAUNCH_ARGS: Mutex<String> = Mutex::new(String::new());
@@ -86,4 +86,24 @@ pub extern "system" fn Java_site_lutfi_foliowriter_Bridge_nativeEvent<'caller>(
         })
         .into_outcome();
     settle("Bridge.nativeEvent", outcome);
+}
+
+/// `Bridge.nativeStopping()`, from `onStop` before GameActivity tells the loop.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_site_lutfi_foliowriter_Bridge_nativeStopping<'caller>(_env: EnvUnowned<'caller>, _this: JObject<'caller>) {
+    saved::stopping();
+}
+
+/// `Bridge.nativeAwaitSaved(int)`, from `onStop`: waits up to that many milliseconds for the loop to write
+/// the settings and the recovery snapshot.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_site_lutfi_foliowriter_Bridge_nativeAwaitSaved<'caller>(
+    _env: EnvUnowned<'caller>,
+    _this: JObject<'caller>,
+    ms: jni::sys::jint,
+) {
+    let ms = u64::try_from(ms).unwrap_or(0).min(5_000);
+    if !saved::wait(std::time::Duration::from_millis(ms)) {
+        log::warn!("stopping before the recovery snapshot was written");
+    }
 }
